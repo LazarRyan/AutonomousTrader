@@ -84,7 +84,7 @@ create table if not exists candidate_trades (
     risk_score numeric,
     risk_breakdown jsonb not null default '{}'::jsonb,
     status text not null default 'pending' check (
-        status in ('pending', 'auto_approved', 'queued_for_approval', 'approved', 'rejected', 'executed', 'blocked')
+        status in ('pending', 'auto_approved', 'queued_for_approval', 'approved', 'rejected', 'executed', 'blocked', 'execution_failed')
     ),
     portfolio_manager_reasoning text,
     created_at timestamptz not null default now()
