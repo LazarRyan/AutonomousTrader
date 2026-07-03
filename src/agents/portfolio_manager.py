@@ -156,11 +156,16 @@ judgment: don't propose spending more cash than is available, don't propose sell
 symbol than are currently held, and don't propose a trade for a symbol with a weak or near-neutral
 blended score just to have something to say.
 
-It is completely normal and often correct to propose NO trades in a given cycle.
+It is completely normal and often correct to propose NO trades in a given cycle. If you don't want to
+trade a symbol -- including a symbol with a strongly bearish score that you can't act on because you
+hold no shares of it and this account cannot short -- simply leave it out of the array entirely. Never
+include a placeholder or zero-quantity entry to explain why you're skipping a symbol; every object in
+the array must be a real, executable trade with a positive quantity.
 
-Respond with ONLY a single JSON array, no other text before or after it, in exactly this shape
-(empty array if no trades are warranted). Put all explanation inside the "reasoning" field of each
-proposal -- do not add any commentary outside the JSON array itself:
+Your ENTIRE reply must be a single JSON array and nothing else. Do not write any explanation,
+preamble, or summary before or after it, even a single sentence -- the very first character of your
+reply must be "[". Put all explanation inside the "reasoning" field of each proposal (empty array "[]"
+if no trades are warranted):
 [{"symbol": "<TICKER>", "side": "buy" | "sell", "quantity": <positive number>, "reasoning": "<one or two sentence explanation>"}]
 """
 
@@ -196,9 +201,13 @@ def build_portfolio_manager_prompt(
 
 def parse_portfolio_manager_response(response_text: str) -> list[CandidateTradeProposal]:
     """Parse and validate the model's JSON reply into candidate trade
-    proposals. Raises ValueError on anything that doesn't match the
-    expected shape. An empty array is valid and means "no trades this
-    cycle" -- that's the model doing its job correctly, not an error.
+    proposals. Raises ValueError only for a systemic problem (unparseable
+    JSON, or the root value isn't an array) -- an individual malformed
+    proposal within an otherwise-good array is skipped and logged, not
+    treated as a reason to discard every other proposal in the same
+    response (see the per-item loop below). An empty array is valid and
+    means "no trades this cycle" -- that's the model doing its job
+    correctly, not an error.
     """
     text = response_text.strip()
 
@@ -212,6 +221,15 @@ def parse_portfolio_manager_response(response_text: str) -> list[CandidateTradeP
     # before parsing -- a real, otherwise-well-formed response for the
     # closely-related news sentiment signal has been seen to contain one.
     text = _fix_invalid_backslash_escapes(text)
+
+    # Skip any leading prose the model added despite instructions not to --
+    # observed in practice on a wider (30-symbol) cycle with more to explain:
+    # the model prefaced the array with a full sentence of reasoning before
+    # the "[" ever appeared, which raw_decode can't handle on its own since
+    # it anchors at the start of the string.
+    array_start = text.find("[")
+    if array_start > 0:
+        text = text[array_start:]
 
     # Use raw_decode (rather than json.loads) so a model that appends stray
     # commentary after the JSON array despite instructions not to (observed
@@ -234,21 +252,34 @@ def parse_portfolio_manager_response(response_text: str) -> list[CandidateTradeP
     proposals: list[CandidateTradeProposal] = []
     for i, item in enumerate(payload):
         if not isinstance(item, dict):
-            raise ValueError(f"Proposal #{i} is not a JSON object: {item!r}")
+            print(f"Portfolio manager proposal #{i} is not a JSON object -- skipping: {item!r}")
+            continue
 
         symbol = item.get("symbol")
         side = item.get("side")
         quantity = item.get("quantity")
         reasoning = item.get("reasoning")
 
+        # Each of these is a single malformed proposal, not a reason to
+        # discard the whole batch -- e.g. a real response once included a
+        # correct, well-formed proposal for every genuinely bullish symbol
+        # AND one spurious zero-quantity placeholder for a bearish symbol
+        # it held no shares of ("cannot short, so no action"), despite the
+        # system prompt now explicitly forbidding that. Under the previous
+        # all-or-nothing behavior, that single bad entry would have thrown
+        # away every other good proposal in the same response.
         if not isinstance(symbol, str) or not symbol.strip():
-            raise ValueError(f"Proposal #{i} has missing/invalid 'symbol': {item!r}")
+            print(f"Portfolio manager proposal #{i} has missing/invalid 'symbol' -- skipping: {item!r}")
+            continue
         if side not in ("buy", "sell"):
-            raise ValueError(f"Proposal #{i} has invalid 'side' (must be 'buy' or 'sell'): {item!r}")
+            print(f"Portfolio manager proposal #{i} has invalid 'side' -- skipping: {item!r}")
+            continue
         if not isinstance(quantity, (int, float)) or quantity <= 0:
-            raise ValueError(f"Proposal #{i} has invalid 'quantity' (must be > 0): {item!r}")
+            print(f"Portfolio manager proposal #{i} has invalid 'quantity' (must be > 0) -- skipping: {item!r}")
+            continue
         if not isinstance(reasoning, str) or not reasoning.strip():
-            raise ValueError(f"Proposal #{i} has missing/invalid 'reasoning': {item!r}")
+            print(f"Portfolio manager proposal #{i} has missing/invalid 'reasoning' -- skipping: {item!r}")
+            continue
 
         proposals.append(
             CandidateTradeProposal(

@@ -4,7 +4,7 @@ AUTONOMOUS-TRADER -- MANUAL DRY RUN
 Paper account status : AccountStatus.ACTIVE
 Paper account equity : $100,000.00
 Paper account cash   : $100,000.00
-Universe (this run)  : AAPL, MSFT, GOOGL, AMZN, NVDA
+Universe (this run)  : 30 symbols (MMM...AWK)
 
 This will make real network calls (Alpaca, SEC EDGAR, Anthropic),
 write real rows to your Supabase project, and MAY place a real
@@ -14,13 +14,31 @@ that scores below the risk-approval threshold.
 Proceed? [y/N] 
 Running cycle...
 
+Traceback (most recent call last):
+  File "/Users/ryanlazar/Documents/AutonomousTrader/src/agents/portfolio_manager.py", line 221, in parse_portfolio_manager_response
+    payload, _ = json.JSONDecoder().raw_decode(text)
+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/opt/anaconda3/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
 
-======================================================================
-Cycle complete. Check results with:
-  Supabase SQL editor:
-    select * from candidate_trades order by created_at desc limit 10;
-    select * from audit_log order by created_at desc limit 20;
-    select * from approval_queue where status = 'pending';
-  If anything is pending approval:
-    python scripts/review_approvals.py
-======================================================================
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/ryanlazar/Documents/AutonomousTrader/scripts/dry_run.py", line 165, in <module>
+    main()
+    ~~~~^^
+  File "/Users/ryanlazar/Documents/AutonomousTrader/scripts/dry_run.py", line 151, in main
+    run_cycle(supabase_client, alpaca_trading_client, settings, sec_user_agent, universe=universe)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/ryanlazar/Documents/AutonomousTrader/src/main.py", line 307, in run_cycle
+    proposals = propose_candidate_trades(
+        blended_scores,
+        PortfolioContext(total_portfolio_value=total_portfolio_value, cash_available=cash_available, holdings=holdings),
+        settings.anthropic_api_key,
+    )
+  File "/Users/ryanlazar/Documents/AutonomousTrader/src/agents/portfolio_manager.py", line 315, in propose_candidate_trades
+    return parse_portfolio_manager_response(response_text)
+  File "/Users/ryanlazar/Documents/AutonomousTrader/src/agents/portfolio_manager.py", line 229, in parse_portfolio_manager_response
+    raise ValueError(f"Portfolio manager response was not valid JSON{hint}: {response_text!r}") from exc
+ValueError: Portfolio manager response was not valid JSON: 'Looking at the strongest signals with no existing holdings to manage, I\'ll focus on the highest-conviction opportunities while diversifying across a handful of names rather than concentrating too much.\n\n[\n  {"symbol": "ABT", "side": "buy", "quantity": 65, "reasoning": "Strong bullish signal (+40.1), one of the highest scores; allocate meaningful position given conviction."},\n  {"symbol": "ABBV", "side": "buy", "quantity": 55, "reasoning": "Strong bullish signal (+39.6) supports a sizable long position."},\n  {"symbol": "GOOGL", "side": "sell", "quantity": 0, "reasoning": "No current holdings to sell despite strongly bearish signal; cannot short in this account, so no action."},\n  {"symbol": "LNT", "side": "buy", "quantity": 100, "reasoning": "Solid bullish score (+28.4) with defensive utility characteristics, good diversification."},\n  {"symbol": "AEP", "side": "buy", "quantity": 90, "reasoning": "Bullish signal (+27.2) in utilities sector adds diversification and stability."},\n  {"symbol": "ALGN", "side": "buy", "quantity": 60, "reasoning": "Bullish score (+24.7) suggests reasonable upside, moderate position size."},\n  {"symbol": "A", "side": "buy", "quantity": 70, "reasoning": "Solid bullish score (+32.5) supports a moderate long position."},\n  {"symbol": "APD", "side": "buy", "quantity": 40, "reasoning": "Bullish signal (+22.2) with industrial gas exposure for diversification."}\n]'

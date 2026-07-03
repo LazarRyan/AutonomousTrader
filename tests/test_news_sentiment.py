@@ -96,6 +96,15 @@ class TestParseSentimentResponse:
         assert result.score == 45.0
         assert result.reasoning == "AWS's $1B AI engineering bet is bullish."
 
+    def test_strips_leading_prose_before_the_json_object(self):
+        # Defensive test mirroring a real bug found in the closely-related
+        # portfolio manager prompt (same model): it prefaced its JSON with
+        # a full sentence of reasoning despite instructions not to, which
+        # raw_decode alone can't handle since it anchors at string start.
+        response = 'Here is my analysis of the headlines.\n\n{"score": 30, "reasoning": "Mildly bullish."}'
+        result = parse_sentiment_response(response)
+        assert result.score == 30.0
+
     def test_still_rejects_genuinely_invalid_json(self):
         # The escape-repair pass shouldn't turn a truly broken response
         # into a silently-accepted one.

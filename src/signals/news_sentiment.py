@@ -113,6 +113,16 @@ def parse_sentiment_response(response_text: str) -> ParsedSentiment:
     # to contain one.
     text = _fix_invalid_backslash_escapes(text)
 
+    # Skip any leading prose the model added despite instructions not to --
+    # the closely-related portfolio manager prompt (same model, same
+    # underlying behavior) was observed doing exactly this on a more
+    # complex cycle, prefacing its JSON with a full sentence of reasoning.
+    # Applied defensively here too even though not yet observed for this
+    # single-object response shape.
+    object_start = text.find("{")
+    if object_start > 0:
+        text = text[object_start:]
+
     # Use raw_decode (rather than json.loads) so a model that appends stray
     # commentary after the JSON object despite instructions not to doesn't
     # cause a hard parse failure -- we only need the first complete JSON

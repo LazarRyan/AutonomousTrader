@@ -137,25 +137,58 @@ class TestParsePortfolioManagerResponse:
         with pytest.raises(ValueError):
             parse_portfolio_manager_response('{"symbol": "AAPL"}')
 
-    def test_raises_on_invalid_side(self):
-        with pytest.raises(ValueError):
-            parse_portfolio_manager_response(
-                '[{"symbol": "AAPL", "side": "hold", "quantity": 1, "reasoning": "x"}]'
-            )
+    def test_invalid_side_is_skipped_not_raised(self):
+        # Changed from raise to skip-and-log after a real bug: a single
+        # malformed proposal used to discard every other good proposal in
+        # the same response (see test_one_bad_proposal_does_not_discard_the_rest).
+        proposals = parse_portfolio_manager_response(
+            '[{"symbol": "AAPL", "side": "hold", "quantity": 1, "reasoning": "x"}]'
+        )
+        assert proposals == []
 
-    def test_raises_on_nonpositive_quantity(self):
-        with pytest.raises(ValueError):
-            parse_portfolio_manager_response(
-                '[{"symbol": "AAPL", "side": "buy", "quantity": 0, "reasoning": "x"}]'
-            )
+    def test_nonpositive_quantity_is_skipped_not_raised(self):
+        proposals = parse_portfolio_manager_response(
+            '[{"symbol": "AAPL", "side": "buy", "quantity": 0, "reasoning": "x"}]'
+        )
+        assert proposals == []
 
-    def test_raises_on_missing_reasoning(self):
-        with pytest.raises(ValueError):
-            parse_portfolio_manager_response('[{"symbol": "AAPL", "side": "buy", "quantity": 1}]')
+    def test_missing_reasoning_is_skipped_not_raised(self):
+        proposals = parse_portfolio_manager_response('[{"symbol": "AAPL", "side": "buy", "quantity": 1}]')
+        assert proposals == []
 
-    def test_raises_on_missing_symbol(self):
-        with pytest.raises(ValueError):
-            parse_portfolio_manager_response('[{"side": "buy", "quantity": 1, "reasoning": "x"}]')
+    def test_missing_symbol_is_skipped_not_raised(self):
+        proposals = parse_portfolio_manager_response('[{"side": "buy", "quantity": 1, "reasoning": "x"}]')
+        assert proposals == []
+
+    def test_one_bad_proposal_does_not_discard_the_rest(self):
+        # Regression test for a real bug found on a wider (30-symbol) live
+        # dry run: the model returned 7 well-formed proposals plus one
+        # spurious zero-quantity placeholder for a symbol it wasn't
+        # actually trading ("cannot short, so no action"). Under the
+        # previous all-or-nothing validation, that single bad entry threw
+        # away every other good proposal in the same response.
+        response = (
+            '[{"symbol": "ABT", "side": "buy", "quantity": 65, "reasoning": "Strong bullish signal."},'
+            '{"symbol": "GOOGL", "side": "sell", "quantity": 0, "reasoning": "No shares to sell; cannot short."},'
+            '{"symbol": "AEP", "side": "buy", "quantity": 90, "reasoning": "Bullish utilities signal."}]'
+        )
+        proposals = parse_portfolio_manager_response(response)
+        symbols = {p.symbol for p in proposals}
+        assert symbols == {"ABT", "AEP"}
+
+    def test_strips_leading_prose_before_the_json_array(self):
+        # Regression test for the same real dry run: the model prefaced
+        # its actual JSON array with a full sentence of reasoning despite
+        # the system prompt instructing otherwise, which raw_decode alone
+        # can't handle since it anchors at the start of the string.
+        response = (
+            "Looking at the strongest signals with no existing holdings, I'll focus on "
+            'the highest-conviction names.\n\n[{"symbol": "ABT", "side": "buy", "quantity": 65, '
+            '"reasoning": "Strong bullish signal."}]'
+        )
+        proposals = parse_portfolio_manager_response(response)
+        assert len(proposals) == 1
+        assert proposals[0].symbol == "ABT"
 
     def test_parses_multiple_proposals(self):
         response = (
