@@ -41,7 +41,25 @@ Split, same pattern as news_sentiment.py:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
+
+# JSON only permits a backslash to be followed by one of: " \ / b f n r t u
+# (the start of a \\uXXXX escape). A backslash before any other character is
+# invalid JSON and fails to parse -- a real Anthropic response for the news
+# sentiment signal (same underlying model/prompting pattern as this module)
+# was seen to contain a JS/Python-style escaped apostrophe inside a
+# "reasoning" string ("AWS\'s $1B AI engineering bet..."), which is invalid
+# JSON even though the overall shape was otherwise correct. Since this is
+# essentially always a cosmetic over-escaping mistake rather than a sign the
+# response is genuinely malformed, the fix is to drop the stray backslash
+# and keep the character, not to fail the whole response over it. Same fix
+# as src/signals/news_sentiment.py's _fix_invalid_backslash_escapes.
+_INVALID_JSON_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrtu])')
+
+
+def _fix_invalid_backslash_escapes(text: str) -> str:
+    return _INVALID_JSON_ESCAPE_RE.sub("", text)
 
 
 # ============================================================
@@ -189,6 +207,11 @@ def parse_portfolio_manager_response(response_text: str) -> list[CandidateTradeP
         if text.startswith("json"):
             text = text[4:]
         text = text.strip()
+
+    # Drop any invalid backslash escapes (see _fix_invalid_backslash_escapes)
+    # before parsing -- a real, otherwise-well-formed response for the
+    # closely-related news sentiment signal has been seen to contain one.
+    text = _fix_invalid_backslash_escapes(text)
 
     # Use raw_decode (rather than json.loads) so a model that appends stray
     # commentary after the JSON array despite instructions not to (observed

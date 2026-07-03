@@ -84,6 +84,24 @@ class TestParseSentimentResponse:
         assert parse_sentiment_response('{"score": 100, "reasoning": "max bullish"}').score == 100.0
         assert parse_sentiment_response('{"score": -100, "reasoning": "max bearish"}').score == -100.0
 
+    def test_tolerates_invalid_backslash_escaped_apostrophe(self):
+        # Regression test for a real bug: a live Anthropic response scoring
+        # AMZN news contained a JS/Python-style escaped apostrophe
+        # ("AWS\'s $1B AI engineering bet...") inside the reasoning string,
+        # which is invalid JSON (backslash may only precede " \ / b f n r t
+        # u) and previously caused a hard parse failure on an otherwise
+        # well-formed, correctly-scored response.
+        response = r'{"score": 45, "reasoning": "AWS\'s $1B AI engineering bet is bullish."}'
+        result = parse_sentiment_response(response)
+        assert result.score == 45.0
+        assert result.reasoning == "AWS's $1B AI engineering bet is bullish."
+
+    def test_still_rejects_genuinely_invalid_json(self):
+        # The escape-repair pass shouldn't turn a truly broken response
+        # into a silently-accepted one.
+        with pytest.raises(ValueError):
+            parse_sentiment_response('{"score": 45, "reasoning": "unterminated string')
+
 
 # ============================================================
 # LLM-in-the-loop fixture test. Skipped unless ANTHROPIC_API_KEY is set.

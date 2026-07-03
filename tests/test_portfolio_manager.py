@@ -165,6 +165,16 @@ class TestParsePortfolioManagerResponse:
         proposals = parse_portfolio_manager_response(response)
         assert len(proposals) == 2
 
+    def test_tolerates_invalid_backslash_escaped_apostrophe(self):
+        # Same real bug class as news_sentiment.py's identical regression
+        # test: a JS/Python-style escaped apostrophe inside a JSON string
+        # (e.g. "AWS\'s big bet") is invalid JSON and previously caused a
+        # hard parse failure on an otherwise well-formed response.
+        response = r'[{"symbol": "AMZN", "side": "buy", "quantity": 10, "reasoning": "AWS\'s big bet is bullish."}]'
+        proposals = parse_portfolio_manager_response(response)
+        assert len(proposals) == 1
+        assert proposals[0].reasoning == "AWS's big bet is bullish."
+
 
 # ============================================================
 # LLM-in-the-loop fixture test. Skipped unless ANTHROPIC_API_KEY is set.
