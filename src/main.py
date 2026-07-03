@@ -32,12 +32,11 @@ Same split as the rest of the project:
      failures), run_cycle() (the actual scheduled entry point), and main().
 
 TRADING UNIVERSE NOTE: build plan section 4a specifies S&P 500 constituents.
-This module does not hardcode that list -- accurately sourcing and
-maintaining 500 tickers is a separate task (e.g. a periodically-refreshed
-static file or a data provider), not something to bake in speculatively
-here. DEFAULT_EXAMPLE_UNIVERSE below is a small, clearly-labeled stand-in
-for local dry runs only -- replace it with the real universe before running
-this against real signals.
+run_cycle() defaults to the real list via src.universe.load_sp500_universe(),
+backed by data/sp500_constituents.csv (see that module's docstring for how
+it's kept fresh). DEFAULT_EXAMPLE_UNIVERSE below is only for passing an
+explicit small override into run_cycle() during manual local dry runs --
+it is not used unless you pass it in yourself.
 """
 
 from __future__ import annotations
@@ -58,6 +57,9 @@ InsertApprovalQueueItemFn = Callable[[str, RiskScoreResult], None]
 # NOT the real S&P 500 -- a small, clearly-labeled example universe for
 # local dry runs only. See module docstring.
 DEFAULT_EXAMPLE_UNIVERSE = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
+
+# Reference symbol for relative-volatility scoring in risk/scorer.py.
+BENCHMARK_SYMBOL = "SPY"
 
 
 def is_trading_halted(safety_state: SafetyState) -> tuple[bool, str]:
@@ -167,12 +169,18 @@ class MarketContext:
     liquidity_penalty: float
 
 
-def gather_signal_snapshot(symbol: str, settings, sec_user_agent: str):
+def gather_signal_snapshot(symbol: str, settings, sec_user_agent: str, cik_map: dict[str, str] | None = None):
     """Call all four signal sources for one symbol, tolerating individual
     source failures (a down/rate-limited source shouldn't take out the
     whole symbol -- compute_blended_signal_score already handles partial
     signal availability). Returns a SignalSnapshot with whichever scores
     were obtainable this cycle.
+
+    cik_map should be the bundled src.universe.load_sp500_cik_map() result,
+    passed in once per cycle by the caller -- NOT refetched from SEC on
+    every symbol, which would mean re-downloading and re-parsing the same
+    multi-thousand-entry ticker->CIK file 500 times per cycle for no
+    reason. Falls back to a live SEC fetch only if no map is supplied.
     """
     from src.agents.portfolio_manager import SignalSnapshot
     from src.signals import congressional, insider_edgar, momentum, news_sentiment
@@ -186,8 +194,9 @@ def gather_signal_snapshot(symbol: str, settings, sec_user_agent: str):
 
     insider_score = None
     try:
-        ticker_map = insider_edgar.fetch_ticker_cik_map(sec_user_agent)
-        cik = ticker_map.get(symbol.upper())
+        cik = (cik_map or {}).get(symbol.upper())
+        if not cik:
+            cik = insider_edgar.fetch_ticker_cik_map(sec_user_agent).get(symbol.upper())
         if cik:
             insider_score = insider_edgar.fetch_insider_signal(symbol, cik, sec_user_agent).score
     except Exception as exc:  # noqa: BLE001
@@ -238,8 +247,10 @@ def run_cycle(
         propose_candidate_trades,
     )
     from src.db import write_audit_log
+    from src.universe import load_sp500_cik_map, load_sp500_universe
 
-    universe = universe or DEFAULT_EXAMPLE_UNIVERSE
+    universe = universe or load_sp500_universe()
+    cik_map = load_sp500_cik_map()
 
     def log_audit(event_type, decision, reasoning, symbol=None, candidate_trade_id=None, metadata=None):
         write_audit_log(
@@ -282,7 +293,7 @@ def run_cycle(
     blend_config = BlendConfig()
     blended_scores: dict[str, float] = {}
     for symbol in universe:
-        snapshot = gather_signal_snapshot(symbol, settings, sec_user_agent)
+        snapshot = gather_signal_snapshot(symbol, settings, sec_user_agent, cik_map=cik_map)
         try:
             blended_scores[symbol] = compute_blended_signal_score(snapshot, blend_config)
         except ValueError:
@@ -348,6 +359,26 @@ def run_cycle(
             }
         ).execute()
 
+    # Benchmark volatility (SPY by default) is computed once per cycle and
+    # reused for every candidate -- risk/scorer.py only cares about the
+    # asset/benchmark RATIO, and recomputing the same benchmark 500 times
+    # would be pure waste.
+    from src.risk.market_data import compute_liquidity_penalty, compute_volatility, fetch_bars_with_volume
+
+    try:
+        benchmark_closes, _ = fetch_bars_with_volume(
+            BENCHMARK_SYMBOL, settings.alpaca_api_key, settings.alpaca_secret_key
+        )
+        benchmark_30d_volatility = compute_volatility(benchmark_closes)
+    except Exception as exc:  # noqa: BLE001
+        log_audit(
+            event_type="cycle",
+            decision="cycle_skipped",
+            reasoning=f"could not compute benchmark ({BENCHMARK_SYMBOL}) volatility, refusing to guess: {exc}",
+        )
+        print(f"Cycle skipped: benchmark volatility unavailable ({exc})")
+        return
+
     for proposal in proposals:
         try:
             quote = alpaca_trading_client.get_latest_quote(proposal.symbol)
@@ -361,19 +392,31 @@ def run_cycle(
             )
             continue
 
-        # Volatility/liquidity inputs to the risk scorer: a full
-        # implementation would compute real 30-day realized volatility and
-        # a real liquidity metric (e.g. from average daily volume/spread).
-        # Not built yet -- using neutral placeholders so the pipeline is
-        # complete end-to-end, flagged here rather than silently treated as
-        # a finished feature.
+        try:
+            asset_closes, asset_volumes = fetch_bars_with_volume(
+                proposal.symbol, settings.alpaca_api_key, settings.alpaca_secret_key
+            )
+            asset_30d_volatility = compute_volatility(asset_closes)
+            liquidity_penalty = compute_liquidity_penalty(asset_closes, asset_volumes)
+        except Exception as exc:  # noqa: BLE001
+            log_audit(
+                event_type="risk_scoring",
+                decision="skipped",
+                reasoning=(
+                    f"could not compute volatility/liquidity for {proposal.symbol}, refusing to "
+                    f"guess a risk score without them: {exc}"
+                ),
+                symbol=proposal.symbol,
+            )
+            continue
+
         process_candidate_trade(
             proposal,
             proposed_price=proposed_price,
             total_portfolio_value=total_portfolio_value,
-            asset_30d_volatility=0.02,
-            benchmark_30d_volatility=0.02,
-            liquidity_penalty=0.0,
+            asset_30d_volatility=asset_30d_volatility,
+            benchmark_30d_volatility=benchmark_30d_volatility,
+            liquidity_penalty=liquidity_penalty,
             insert_candidate_trade=insert_candidate_trade,
             insert_approval_queue_item=insert_approval_queue_item,
             execute_trade_fn=execute_trade_fn,

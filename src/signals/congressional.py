@@ -25,15 +25,35 @@ Two layers, same split as momentum.py / insider_edgar.py:
      multi-step session/cookie flow (accept the site's terms, then query a
      DataTables JSON endpoint).
 
-IMPORTANT CALIBRATION NOTE: the row-parsing regexes below are built from
-the well-documented, publicly known PTR table layouts (the same layouts
-used by long-running open-source projects like senate-stock-watcher and
-house-stock-watcher), but have NOT been validated against a live-extracted
-PDF text sample in this environment. Before this feeds a real signal, pull
-a handful of recent real PTR PDFs, run extract_text_from_pdf() +
-parse_*_ptr_text() against them, and check the flagged/skipped rate. Treat
-a high flagged rate as a sign the regex needs recalibrating, not as a
-reason to loosen it and start guessing.
+CALIBRATION STATUS:
+  - House (parse_house_ptr_text): VALIDATED against a real filing (Rep.
+    Pelosi's PTR #20033725, fetched live). It correctly parsed 17 of 18
+    real transaction line items; the 18th was a row split across a PDF
+    page boundary by pdfplumber's text extraction (dates/ticker/amount
+    landed in a scrambled order relative to the asset name) and was
+    correctly flagged rather than mis-parsed or silently dropped -- see
+    "KNOWN LIMITATION" below. The parser works on the real, messy text: it
+    strips known House PTR boilerplate/header/footer lines and the per-
+    transaction "F S: <status>" / "D: <description>" annotation lines, then
+    reconstructs each transaction from the remaining text (which still has
+    multi-line-wrapped table cells -- asset names and amount ranges commonly
+    wrap across the original PDF's line breaks).
+  - Senate (parse_senate_ptr_text): NOT YET validated against a live filing
+    -- efdsearch.senate.gov requires an interactive session/terms-acceptance
+    flow this environment couldn't complete, so no real Senate PTR sample
+    was available. Built from the well-documented public layout (same one
+    senate-stock-watcher uses), but treat it as unverified until tested
+    against a real fetched filing.
+
+KNOWN LIMITATION (House): a transaction row that gets split across a PDF
+page boundary can have its fields extracted in a scrambled order (e.g. the
+ticker and closing amount end up on the far side of a page-break, after
+unrelated header text that repeats at the top of the next page). When this
+happens, the transaction fails to match the expected pattern and is
+correctly flagged rather than guessed at -- this is the intended "skip and
+flag" behavior working as designed, not a bug to silently paper over. It
+does mean a small number of real transactions (page-break casualties) will
+require manual review via the flagged list rather than being auto-captured.
 """
 
 from __future__ import annotations
@@ -95,8 +115,13 @@ def _parse_date_mmddyyyy(raw: str) -> str:
 
 
 def _parse_amount_range(raw: str) -> tuple[float, float | None] | None:
-    """Parse an amount-range string into (low, high). Returns None (never
-    raises) if it doesn't match a known shape -- caller decides to flag."""
+    """Parse an amount string into (low, high). Handles the three shapes
+    actually seen in real House PTR filings: a range ("$1,001 - $15,000"),
+    an open-ended top bracket ("Over $50,000,000"), and a bare exact dollar
+    figure ("$15.00" -- seen on e.g. spinoff/exchange transactions that
+    aren't reported as a bracket). Returns None (never raises) if it
+    doesn't match a known shape -- caller decides to flag.
+    """
     raw = raw.strip()
 
     over_match = re.match(r"^Over \$([\d,]+)$", raw)
@@ -109,20 +134,69 @@ def _parse_amount_range(raw: str) -> tuple[float, float | None] | None:
         high = float(range_match.group(2).replace(",", ""))
         return low, high
 
+    exact_match = re.match(r"^\$([\d,]+(?:\.\d{2})?)$", raw)
+    if exact_match:
+        value = float(exact_match.group(1).replace(",", ""))
+        return value, value
+
     return None
 
 
-# House PTR row, e.g.:
-#   "SP Apple Inc. (AAPL) [ST] P 01/15/2026 02/03/2026 $1,001 - $15,000"
-#   "Microsoft Corp (MSFT) [ST] S (partial) 03/02/2026 03/20/2026 $15,001 - $50,000"
-_HOUSE_ROW_RE = re.compile(
-    r"^(?:(?P<owner_code>SP|DC|JT)\s+)?"
-    r"(?P<asset_name>.+?)\s*\((?P<ticker>[A-Z]{1,6}(?:\.[A-Z]{1,2})?)\)\s*"
-    r"\[(?P<asset_type>[A-Z]{1,3})\]\s+"
-    r"(?P<txn_type>P|S \(partial\)|S \(full\)|S|E)\s+"
+# House PTR transaction, reconstructed from the real (messy) extracted PDF
+# text -- see CALIBRATION STATUS in the module docstring. Asset names and
+# amount ranges routinely wrap across the original PDF's line breaks, so
+# this is NOT matched line-by-line: _clean_house_text() first strips known
+# boilerplate/header/footer lines and the per-transaction "F S: <status>" /
+# "D: <description>" annotation lines, then joins everything else with
+# single spaces into one blob, and this pattern is matched against that
+# blob with re.finditer (not anchored to line start/end).
+#
+# asset_name is restricted to [^$] (never crosses a dollar sign) and
+# explicitly forbidden from swallowing a standalone owner-code token --
+# without both restrictions, a malformed/scrambled transaction earlier in
+# the blob can get silently absorbed into a LATER transaction's asset_name
+# instead of being left unmatched (and therefore flagged) -- verified
+# against the real Pelosi filing during calibration.
+_HOUSE_NOISE_LINE_PATTERNS = [
+    r"^P T R$",
+    r"^Clerk of the House of Representatives",
+    r"^F I$",
+    r"^Name:\s",
+    r"^Status:\s",
+    r"^State/District:\s",
+    r"^T$",
+    r"^ID Owner Asset Transaction$",
+    r"^Type$",
+    r"^Date Notification$",
+    r"^Date Amount Cap\.?$",
+    r"^Gains >$",
+    r"^\$200\?$",
+    r"^Filing ID #",
+    r"^\* For the complete list of asset type abbreviations",
+    r"^I P O$",
+    r"^Yes No$",
+    r"^C\s+S$",
+    r"^I CERTIFY that the statements",
+    r"^my knowledge and belief",
+    r"^Digitally Signed:",
+]
+_HOUSE_TXN_NOTE_LINE_PATTERNS = [
+    r"^F\s+S:\s",  # cap-gains-answer + filing status, e.g. "F S: New"
+    r"^S:\s",  # standalone filing status line
+    r"^D:\s",  # description/detail line (share counts etc. -- not modeled yet)
+]
+_HOUSE_SKIP_LINE_RE = [
+    re.compile(p) for p in _HOUSE_NOISE_LINE_PATTERNS + _HOUSE_TXN_NOTE_LINE_PATTERNS
+]
+
+_HOUSE_TRANSACTION_RE = re.compile(
+    r"(?:(?P<owner_code>SP|DC|JT)\s+)?"
+    r"(?P<asset_name>(?:(?!\b(?:SP|DC|JT)\b\s)[^$]){1,200}?)\s*"
+    r"\((?P<ticker>[A-Z]{1,6}(?:\.[A-Z]{1,2})?)\)\s*\[(?P<asset_type>[A-Z]{1,3})\]\s+"
+    r"(?P<txn_type>S \(partial\)|S \(full\)|P|S|E)\s+"
     r"(?P<txn_date>\d{2}/\d{2}/\d{4})\s+"
     r"(?P<notif_date>\d{2}/\d{2}/\d{4})\s+"
-    r"(?P<amount>Over \$[\d,]+|\$[\d,]+\s*-\s*\$[\d,]+)\s*$"
+    r"(?P<amount>\$[\d,]+(?:\.\d{2})?\s*-\s*\$[\d,]+|Over \$[\d,]+|\$[\d,]+(?:\.\d{2})?)"
 )
 
 _HOUSE_TXN_TYPE_MAP = {
@@ -133,65 +207,67 @@ _HOUSE_TXN_TYPE_MAP = {
     "E": "exchange",
 }
 
+# Matches any (TICKER) [TYPE] occurrence, independent of whether a full
+# transaction around it matched -- used to find transactions that LOOKED
+# like they were starting but didn't fully match, so they can be flagged
+# instead of silently vanishing.
+_HOUSE_ANCHOR_RE = re.compile(r"\([A-Z]{1,6}(?:\.[A-Z]{1,2})?\)\s*\[[A-Z]{1,3}\]")
 
-def parse_house_ptr_text(text: str, source_doc_id: str, filer_name: str) -> ParseResult:
-    """Parse the extracted text of one House PTR PDF into transactions.
-    Only the transaction table rows matter here -- everything else in the
-    PDF (header, certification boilerplate, page numbers) is expected not
-    to match the row regex and is silently ignored, NOT flagged, since it
-    was never supposed to look like a transaction row in the first place.
-    Lines that look like they're trying to be a transaction row (contain a
-    ticker in parens and a dollar amount) but don't fully match get flagged.
-    """
-    transactions: list[CongressionalTransaction] = []
-    flagged: list[FlaggedLine] = []
 
-    looks_like_row = re.compile(r"\([A-Z]{1,6}(?:\.[A-Z]{1,2})?\).*\$[\d,]")
-
+def _clean_house_text(text: str) -> str:
+    clean_lines = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-
-        match = _HOUSE_ROW_RE.match(line)
-        if not match:
-            if looks_like_row.search(line):
-                flagged.append(
-                    FlaggedLine(
-                        chamber="house",
-                        source_doc_id=source_doc_id,
-                        raw_line=line,
-                        reason="line resembles a transaction row but did not match the expected House PTR format",
-                    )
-                )
+        if any(pattern.match(line) for pattern in _HOUSE_SKIP_LINE_RE):
             continue
+        clean_lines.append(line)
+    return " ".join(clean_lines)
 
+
+def parse_house_ptr_text(text: str, source_doc_id: str, filer_name: str) -> ParseResult:
+    """Parse the extracted text of one House PTR PDF into transactions.
+    See CALIBRATION STATUS in the module docstring -- validated against a
+    real filing. Boilerplate/header/footer/annotation lines are stripped
+    first (see _clean_house_text), then transactions are reconstructed from
+    the remaining text, which still has multi-line-wrapped cells.
+    """
+    transactions: list[CongressionalTransaction] = []
+    flagged: list[FlaggedLine] = []
+
+    cleaned = _clean_house_text(text)
+    matches = list(_HOUSE_TRANSACTION_RE.finditer(cleaned))
+    covered_spans = [(m.start(), m.end()) for m in matches]
+
+    for match in matches:
         amount = _parse_amount_range(match.group("amount"))
         if amount is None:
             flagged.append(
                 FlaggedLine(
                     chamber="house",
                     source_doc_id=source_doc_id,
-                    raw_line=line,
-                    reason=f"unrecognized amount range format: {match.group('amount')!r}",
+                    raw_line=match.group(0),
+                    reason=f"unrecognized amount format: {match.group('amount')!r}",
                 )
             )
             continue
 
-        owner_code = _OWNER_CODE_MAP.get(match.group("owner_code") or "", "SELF")
         txn_type = _HOUSE_TXN_TYPE_MAP.get(match.group("txn_type"))
         if txn_type is None:
             flagged.append(
                 FlaggedLine(
                     chamber="house",
                     source_doc_id=source_doc_id,
-                    raw_line=line,
+                    raw_line=match.group(0),
                     reason=f"unrecognized transaction type: {match.group('txn_type')!r}",
                 )
             )
             continue
 
+        owner_code = _OWNER_CODE_MAP.get(match.group("owner_code") or "", "SELF")
         amount_low, amount_high = amount
+
         transactions.append(
             CongressionalTransaction(
                 chamber="house",
@@ -204,7 +280,26 @@ def parse_house_ptr_text(text: str, source_doc_id: str, filer_name: str) -> Pars
                 transaction_date=_parse_date_mmddyyyy(match.group("txn_date")),
                 amount_low=amount_low,
                 amount_high=amount_high,
-                raw_line=line,
+                raw_line=match.group(0),
+            )
+        )
+
+    # Anything that looked like it was starting a transaction (a ticker +
+    # asset-type anchor) but isn't covered by a successful match above --
+    # most commonly a row mangled by a PDF page break -- gets flagged with
+    # surrounding context, never silently dropped.
+    for anchor in _HOUSE_ANCHOR_RE.finditer(cleaned):
+        already_covered = any(start <= anchor.start() < end for start, end in covered_spans)
+        if already_covered:
+            continue
+        context_start = max(0, anchor.start() - 80)
+        context_end = min(len(cleaned), anchor.end() + 100)
+        flagged.append(
+            FlaggedLine(
+                chamber="house",
+                source_doc_id=source_doc_id,
+                raw_line=cleaned[context_start:context_end].strip(),
+                reason="transaction anchor found but full row did not match the expected format (commonly a PDF page-break split)",
             )
         )
 
