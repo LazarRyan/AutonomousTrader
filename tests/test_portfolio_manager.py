@@ -217,6 +217,85 @@ class TestParsePortfolioManagerResponse:
             parse_portfolio_manager_response(truncated)
 
 
+class TestProposeCandidateTradesRetry:
+    """propose_candidate_trades' retry-on-parse-failure loop, tested with a
+    mocked Anthropic client -- no real network/API key needed, since this is
+    testing control flow, not the model's actual behavior. Same fix, same
+    hard evidence as news_sentiment.py's identical TestScoreNewsSentimentRetry
+    -- see that class's docstring for the diagnostic that ruled out
+    budget/thinking as the cause of the underlying truncation-shaped bug.
+    """
+
+    def _fake_response(self, text: str):
+        from unittest.mock import MagicMock
+
+        block = MagicMock()
+        block.type = "text"
+        block.text = text
+        response = MagicMock()
+        response.content = [block]
+        return response
+
+    def _portfolio(self):
+        return PortfolioContext(total_portfolio_value=100_000.0, cash_available=40_000.0, holdings=[])
+
+    def test_retries_once_on_malformed_first_response_then_succeeds(self):
+        from unittest.mock import MagicMock, patch
+
+        from src.agents.portfolio_manager import propose_candidate_trades
+
+        truncated = '[{"symbol": "ABT", "side": "buy", "quantity": 65, "reasoning": "cut off'
+        good = '[{"symbol": "ABT", "side": "buy", "quantity": 65, "reasoning": "Complete this time."}]'
+
+        with patch("anthropic.Anthropic") as mock_anthropic_cls:
+            mock_client = MagicMock()
+            mock_anthropic_cls.return_value = mock_client
+            mock_client.messages.create.side_effect = [
+                self._fake_response(truncated),
+                self._fake_response(good),
+            ]
+
+            proposals = propose_candidate_trades({"ABT": 80.0}, self._portfolio(), anthropic_api_key="fake-key")
+
+        assert len(proposals) == 1
+        assert proposals[0].symbol == "ABT"
+        assert mock_client.messages.create.call_count == 2
+
+    def test_does_not_retry_when_first_response_is_valid(self):
+        from unittest.mock import MagicMock, patch
+
+        from src.agents.portfolio_manager import propose_candidate_trades
+
+        good = '[{"symbol": "ABT", "side": "buy", "quantity": 65, "reasoning": "Fine the first time."}]'
+
+        with patch("anthropic.Anthropic") as mock_anthropic_cls:
+            mock_client = MagicMock()
+            mock_anthropic_cls.return_value = mock_client
+            mock_client.messages.create.return_value = self._fake_response(good)
+
+            proposals = propose_candidate_trades({"ABT": 80.0}, self._portfolio(), anthropic_api_key="fake-key")
+
+        assert len(proposals) == 1
+        assert mock_client.messages.create.call_count == 1
+
+    def test_raises_last_error_after_exhausting_all_attempts(self):
+        from unittest.mock import MagicMock, patch
+
+        from src.agents.portfolio_manager import propose_candidate_trades
+
+        truncated = '[{"symbol": "ABT", "side": "buy", "quantity": 65, "reasoning": "still cut off"'
+
+        with patch("anthropic.Anthropic") as mock_anthropic_cls:
+            mock_client = MagicMock()
+            mock_anthropic_cls.return_value = mock_client
+            mock_client.messages.create.return_value = self._fake_response(truncated)
+
+            with pytest.raises(ValueError, match="truncated"):
+                propose_candidate_trades({"ABT": 80.0}, self._portfolio(), anthropic_api_key="fake-key")
+
+        assert mock_client.messages.create.call_count == 2
+
+
 # ============================================================
 # LLM-in-the-loop fixture test. Skipped unless ANTHROPIC_API_KEY is set.
 # ============================================================

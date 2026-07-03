@@ -316,6 +316,7 @@ def propose_candidate_trades(
     portfolio: PortfolioContext,
     anthropic_api_key: str,
     model: str = "claude-sonnet-5",
+    max_attempts: int = 2,
 ) -> list[CandidateTradeProposal]:
     """End-to-end: build the prompt, call the Anthropic API, parse the
     reply. Thin glue around the tested pure functions above."""
@@ -335,12 +336,36 @@ def propose_candidate_trades(
     # too. max_tokens raised from 1000 defensively -- proposes trades across
     # potentially many symbols per cycle, so gets more headroom than the
     # single-symbol sentiment call even with thinking off.
-    response = client.messages.create(
-        model=model,
-        max_tokens=2048,
-        system=_SYSTEM_PROMPT,
-        thinking={"type": "disabled"},
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-    response_text = _extract_response_text(response)
-    return parse_portfolio_manager_response(response_text)
+    #
+    # Retry loop: same fix, same evidence as score_news_sentiment's sibling
+    # bug -- a hard-evidence diagnostic (scripts/debug_sentiment_truncation.py)
+    # showed the identical failure signature on this model/prompting pattern
+    # is a rare non-deterministic formatting slip (model stops with
+    # stop_reason="end_turn" right after closing a string field, well under
+    # its token budget, thinking genuinely off), not a budget/thinking issue.
+    # A single parse failure here is a systemic problem for the whole cycle
+    # (parse_portfolio_manager_response raises when the JSON array itself is
+    # unparseable, unlike per-item skip-and-flag for individual bad
+    # proposals), so it's worth a bounded retry before giving up rather than
+    # losing every proposal in the batch to one rare hiccup.
+    last_error: ValueError | None = None
+    for attempt in range(1, max_attempts + 1):
+        response = client.messages.create(
+            model=model,
+            max_tokens=2048,
+            system=_SYSTEM_PROMPT,
+            thinking={"type": "disabled"},
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        response_text = _extract_response_text(response)
+        try:
+            return parse_portfolio_manager_response(response_text)
+        except ValueError as exc:
+            last_error = exc
+            print(
+                f"Portfolio manager response attempt {attempt}/{max_attempts} failed to parse "
+                f"({'retrying' if attempt < max_attempts else 'giving up'}): {exc}"
+            )
+
+    assert last_error is not None  # loop always sets this before falling through
+    raise last_error

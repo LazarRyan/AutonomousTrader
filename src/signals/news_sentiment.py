@@ -203,7 +203,11 @@ def _extract_response_text(response) -> str:
 
 
 def score_news_sentiment(
-    symbol: str, headlines: list[str], anthropic_api_key: str, model: str = "claude-sonnet-5"
+    symbol: str,
+    headlines: list[str],
+    anthropic_api_key: str,
+    model: str = "claude-sonnet-5",
+    max_attempts: int = 2,
 ) -> NewsSentimentResult:
     """End-to-end: build the prompt, call the Anthropic API, parse the
     reply. Thin glue around the tested pure functions above.
@@ -213,32 +217,57 @@ def score_news_sentiment(
     client = anthropic.Anthropic(api_key=anthropic_api_key)
     user_prompt = build_sentiment_prompt(symbol, headlines)
 
-    # ROOT CAUSE, found after two rounds of real truncation bugs (AMZN, then
-    # NVDA again even after raising max_tokens 300 -> 1024): per Anthropic's
-    # docs, Claude Sonnet 5 uses adaptive thinking that's ON BY DEFAULT with
-    # no `thinking` config needed, and its thinking tokens count against the
-    # same max_tokens budget as the visible reply -- explaining both the
-    # ThinkingBlock content we found earlier (_extract_response_text) and
-    # why a short ~370-char JSON reply could still get cut off mid-string at
-    # max_tokens=1024: the model was spending an unpredictable share of that
-    # budget on invisible reasoning before ever emitting the JSON. This is a
-    # simple single-shot classification task with no need for step-by-step
-    # reasoning, so thinking is turned off outright rather than just raising
-    # max_tokens again and hoping the next headline set doesn't need more
-    # thinking than that guess allows.
-    response = client.messages.create(
-        model=model,
-        max_tokens=1024,
-        system=_SYSTEM_PROMPT,
-        thinking={"type": "disabled"},
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-    response_text = _extract_response_text(response)
-    parsed = parse_sentiment_response(response_text)
+    # thinking disabled outright -- root-caused after two rounds of real
+    # truncation bugs (AMZN, then NVDA again even after raising max_tokens
+    # 300 -> 1024): per Anthropic's docs, Claude Sonnet 5 uses adaptive
+    # thinking that's ON BY DEFAULT with no `thinking` config needed, and its
+    # thinking tokens count against the same max_tokens budget as the visible
+    # reply. This is a simple single-shot classification task with no need
+    # for step-by-step reasoning, so thinking is turned off rather than
+    # raising max_tokens again and hoping the guess is high enough.
+    #
+    # Retry loop added after a THIRD real truncation-shaped failure (MMM)
+    # happened despite thinking being disabled. Diagnosed with hard evidence
+    # (scripts/debug_sentiment_truncation.py) instead of guessing again: a
+    # follow-up call with the same symbol's real headlines came back with
+    # stop_reason="end_turn", thinking_tokens=0, and only 128/1024 output
+    # tokens used -- a complete, valid, correctly-closed JSON reply. That
+    # rules out budget/thinking as the cause of the earlier failure; this is
+    # a rare, non-deterministic model formatting slip (it stops right after
+    # closing the "reasoning" string without ever emitting the final "}"),
+    # not a systemic bug. A bounded retry is the right fix for that failure
+    # mode -- costs nothing extra when the first attempt is fine, and doesn't
+    # guess at any value, consistent with this project's "skip and flag,
+    # never guess" discipline. If every attempt fails, the exception still
+    # propagates to gather_signal_snapshot's existing per-source try/except,
+    # which already tolerates one signal source being unavailable for a
+    # symbol this cycle.
+    last_error: ValueError | None = None
+    for attempt in range(1, max_attempts + 1):
+        response = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            system=_SYSTEM_PROMPT,
+            thinking={"type": "disabled"},
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        response_text = _extract_response_text(response)
+        try:
+            parsed = parse_sentiment_response(response_text)
+        except ValueError as exc:
+            last_error = exc
+            print(
+                f"[{symbol}] sentiment response attempt {attempt}/{max_attempts} failed to parse "
+                f"({'retrying' if attempt < max_attempts else 'giving up'}): {exc}"
+            )
+            continue
 
-    return NewsSentimentResult(
-        symbol=symbol,
-        score=parsed.score,
-        reasoning=parsed.reasoning,
-        num_headlines_considered=len(headlines),
-    )
+        return NewsSentimentResult(
+            symbol=symbol,
+            score=parsed.score,
+            reasoning=parsed.reasoning,
+            num_headlines_considered=len(headlines),
+        )
+
+    assert last_error is not None  # loop always sets this before falling through
+    raise last_error

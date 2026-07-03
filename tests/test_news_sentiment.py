@@ -123,6 +123,89 @@ class TestParseSentimentResponse:
             parse_sentiment_response(truncated)
 
 
+class TestScoreNewsSentimentRetry:
+    """score_news_sentiment's retry-on-parse-failure loop, tested with a
+    mocked Anthropic client -- no real network/API key needed, since this is
+    testing control flow (does it retry, does it stop retrying, does it
+    raise after exhausting attempts), not the model's actual behavior.
+
+    Added after a real, hard-evidence-diagnosed bug: a live MMM sentiment
+    call was cut off mid-JSON (stopped right after the "reasoning" string
+    closed, no final "}") even with thinking explicitly disabled. Running
+    scripts/debug_sentiment_truncation.py against the same symbol's real
+    headlines came back with stop_reason="end_turn", thinking_tokens=0, and
+    only 128/1024 output tokens used -- a complete, valid response using the
+    identical code path. That rules out budget/thinking as the cause; it's a
+    rare, non-deterministic model formatting slip, which a bounded retry is
+    the right fix for (see score_news_sentiment's docstring comment).
+    """
+
+    def _fake_response(self, text: str):
+        from unittest.mock import MagicMock
+
+        block = MagicMock()
+        block.type = "text"
+        block.text = text
+        response = MagicMock()
+        response.content = [block]
+        return response
+
+    def test_retries_once_on_malformed_first_response_then_succeeds(self):
+        from unittest.mock import MagicMock, patch
+
+        from src.signals.news_sentiment import score_news_sentiment
+
+        truncated = '{"score": 20, "reasoning": "cut off before the closing brace'
+        good = '{"score": 20, "reasoning": "Complete and valid this time."}'
+
+        with patch("anthropic.Anthropic") as mock_anthropic_cls:
+            mock_client = MagicMock()
+            mock_anthropic_cls.return_value = mock_client
+            mock_client.messages.create.side_effect = [
+                self._fake_response(truncated),
+                self._fake_response(good),
+            ]
+
+            result = score_news_sentiment("MMM", ["headline"], anthropic_api_key="fake-key")
+
+        assert result.score == 20.0
+        assert mock_client.messages.create.call_count == 2
+
+    def test_does_not_retry_when_first_response_is_valid(self):
+        from unittest.mock import MagicMock, patch
+
+        from src.signals.news_sentiment import score_news_sentiment
+
+        good = '{"score": 10, "reasoning": "Fine the first time."}'
+
+        with patch("anthropic.Anthropic") as mock_anthropic_cls:
+            mock_client = MagicMock()
+            mock_anthropic_cls.return_value = mock_client
+            mock_client.messages.create.return_value = self._fake_response(good)
+
+            result = score_news_sentiment("AAPL", ["headline"], anthropic_api_key="fake-key")
+
+        assert result.score == 10.0
+        assert mock_client.messages.create.call_count == 1
+
+    def test_raises_last_error_after_exhausting_all_attempts(self):
+        from unittest.mock import MagicMock, patch
+
+        from src.signals.news_sentiment import score_news_sentiment
+
+        truncated = '{"score": 20, "reasoning": "still cut off before the brace"'
+
+        with patch("anthropic.Anthropic") as mock_anthropic_cls:
+            mock_client = MagicMock()
+            mock_anthropic_cls.return_value = mock_client
+            mock_client.messages.create.return_value = self._fake_response(truncated)
+
+            with pytest.raises(ValueError, match="truncated"):
+                score_news_sentiment("MMM", ["headline"], anthropic_api_key="fake-key")
+
+        assert mock_client.messages.create.call_count == 2
+
+
 # ============================================================
 # LLM-in-the-loop fixture test. Skipped unless ANTHROPIC_API_KEY is set.
 # ============================================================
