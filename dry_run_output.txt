@@ -14,7 +14,6 @@ that scores below the risk-approval threshold.
 Proceed? [y/N] 
 Running cycle...
 
-[NVDA] news sentiment signal failed, continuing without it: Sentiment response was not valid JSON (response appears truncated -- got cut off before valid JSON completed; consider raising max_tokens): '{"score": 15, "reasoning": "Mixed set: mild positives like Nvidia\'s new cloud/revenue-sharing program for AI startups and continued AI infrastructure momentum are offset by chip sector volatility (SOXX worst drop), competitor chip deals (Meta/Samsung), and reports of AI spending pullbacks at Tesla/Uber, resulting in a modestly bullish but largely neutral net tone."'
 
 ======================================================================
 Cycle complete. Check results with:

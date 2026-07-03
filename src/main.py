@@ -310,6 +310,29 @@ def run_cycle(
         settings.anthropic_api_key,
     )
 
+    # "The portfolio manager looked at real signal data and decided nothing
+    # was worth proposing" is a real, deliberate decision -- it needs its
+    # own audit_log row same as every other decision, taken or not. Without
+    # this, a cycle that ran a real LLM call and consciously chose to do
+    # nothing is indistinguishable in the audit trail from a cycle that
+    # never got this far at all (confirmed as a real gap: the first fully
+    # clean dry run -- all four signal sources working, thinking disabled,
+    # no truncation -- produced zero proposals and, before this fix, wrote
+    # nothing to audit_log at all for that outcome).
+    if not proposals:
+        log_audit(
+            event_type="cycle",
+            decision="no_trades_proposed",
+            reasoning=(
+                f"portfolio manager proposed no trades this cycle for "
+                f"{len(blended_scores)} symbol(s) with usable signal data -- "
+                f"a valid, deliberate outcome, not a failure"
+            ),
+            metadata={"blended_scores": blended_scores},
+        )
+        print("Cycle complete: portfolio manager proposed no trades this cycle")
+        return
+
     place_order, _log_audit_unused, record_executed_trade, update_candidate_trade_status = make_live_dependencies(
         supabase_client, alpaca_trading_client
     )
