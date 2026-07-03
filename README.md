@@ -19,21 +19,57 @@ only supported mode. Live trading requires a distinct `TRADING_MODE=live`
 env var *and* a manual confirmation step in the execution agent that does
 not exist yet and will be built as its own deliberate second phase.
 
-## Status: Phase 0 (scaffolding)
+## Status: end-to-end pipeline built, not yet run live
 
-What exists right now:
-- Repo layout, `.env.example`, `pyproject.toml`.
+Every stage of the architecture (signals -> blending -> portfolio manager ->
+risk scoring -> execution/approval -> audit log) is implemented and covered
+by unit tests (147 passing, 6 more gated behind a real `ANTHROPIC_API_KEY`).
+What's built:
+
 - Supabase schema (`supabase/schema.sql`): `holdings`, `signals`,
   `candidate_trades`, `executed_trades`, `approval_queue`, `audit_log`,
-  `safety_state`, `config`.
-- `src/risk/scorer.py` -- deterministic composite risk score, fully
-  implemented and unit-tested.
-- `src/risk/safety_rails.py` -- kill switch, max position size, daily/weekly
-  loss auto-halt, fully implemented and unit-tested.
-- Everything else (`src/signals/*`, `src/agents/*`, `src/main.py`,
-  `scripts/review_approvals.py`) is a stub with a docstring describing what
-  it will do -- deliberately not built yet, per the phase discipline in the
-  build plan.
+  `safety_state`, `config`. Applied to a dedicated Supabase project.
+- `src/risk/scorer.py` + `src/risk/safety_rails.py` -- deterministic
+  composite risk score and non-negotiable safety rails. Fully tested.
+- `src/signals/momentum.py` -- deterministic SMA crossover + RSI(14) + 10d
+  ROC. Fully tested with synthetic price series.
+- `src/signals/insider_edgar.py` -- SEC EDGAR Form 4 parsing + weighted
+  composite score. Fully tested with fixture XML.
+- `src/signals/congressional.py` -- House/Senate PTR parsing with
+  skip-and-flag discipline. **Parsing regexes are not yet validated against
+  a live-extracted PDF** -- see the calibration note in the module
+  docstring before relying on this signal.
+- `src/signals/news_sentiment.py` -- Anthropic-based sentiment scoring.
+  Prompt/parsing logic tested; a fixture-headline direction test exists but
+  is skipped without a real API key.
+- `src/agents/portfolio_manager.py` -- blended-signal scoring (tested) +
+  LLM trade proposals (fixture-scenario test gated on API key).
+- `src/agents/execution.py` -- the only module that places orders. Trading-
+  mode gate, safety-rail gate, and order placement all have full
+  control-flow test coverage via dependency injection.
+- `scripts/review_approvals.py` -- the CLI approval watcher, meant to run
+  continuously. Display formatting and approval-decision handling are
+  fully tested via fakes.
+- `src/main.py` -- the scheduled run loop tying it all together.
+  `is_trading_halted` and `process_candidate_trade` (the auto-execute vs.
+  queue-for-approval decision) are fully tested; the signal-gathering loop
+  itself is thin glue over the tested pieces, same as every other
+  network-touching module in this project.
+
+**Not yet done before this can run for real:**
+- Populate real Alpaca paper-trading keys (trading toolset) and a real
+  `ANTHROPIC_API_KEY` in `.env`.
+- Replace `DEFAULT_EXAMPLE_UNIVERSE` in `src/main.py` (5 tickers) with the
+  real S&P 500 constituent list -- sourcing and maintaining that list is
+  its own task, not done yet.
+- Validate the congressional PTR parser against real filings.
+- Real 30-day volatility and liquidity metrics feed the risk scorer with
+  neutral placeholders right now (see `run_cycle` in `src/main.py`) --
+  needs real historical-bar-based calculations before risk scores mean
+  anything.
+- Nothing has been run against a live paper account yet. Every "thin
+  wrapper" function that talks to Alpaca/EDGAR/House/Senate/Anthropic is
+  implemented but untested against the live network from this environment.
 
 ## Setup
 
