@@ -1,0 +1,27 @@
+======================================================================
+AUTONOMOUS-TRADER -- MANUAL DRY RUN
+======================================================================
+Paper account status : AccountStatus.ACTIVE
+Paper account equity : $100,000.00
+Paper account cash   : $100,000.00
+Universe (this run)  : AAPL, MSFT, GOOGL, AMZN, NVDA
+
+This will make real network calls (Alpaca, SEC EDGAR, Anthropic),
+write real rows to your Supabase project, and MAY place a real
+(paper) Alpaca order if the portfolio manager proposes a trade
+that scores below the risk-approval threshold.
+
+Proceed? [y/N] 
+Running cycle...
+
+[NVDA] news sentiment signal failed, continuing without it: Sentiment response was not valid JSON (response appears truncated -- got cut off before valid JSON completed; consider raising max_tokens): '{"score": 15, "reasoning": "Mixed set: mild positives like Nvidia\'s new cloud/revenue-sharing program for AI startups and continued AI infrastructure momentum are offset by chip sector volatility (SOXX worst drop), competitor chip deals (Meta/Samsung), and reports of AI spending pullbacks at Tesla/Uber, resulting in a modestly bullish but largely neutral net tone."'
+
+======================================================================
+Cycle complete. Check results with:
+  Supabase SQL editor:
+    select * from candidate_trades order by created_at desc limit 10;
+    select * from audit_log order by created_at desc limit 20;
+    select * from approval_queue where status = 'pending';
+  If anything is pending approval:
+    python scripts/review_approvals.py
+======================================================================

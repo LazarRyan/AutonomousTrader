@@ -203,18 +203,24 @@ def score_news_sentiment(
     client = anthropic.Anthropic(api_key=anthropic_api_key)
     user_prompt = build_sentiment_prompt(symbol, headlines)
 
-    # max_tokens=300 was too low in practice: two separate real responses
-    # (AMZN, NVDA) were cut off mid-JSON, always right after the closing
-    # quote of "reasoning" but before the final "}" -- a genuine truncation,
-    # not an escaping issue (that's handled separately by
-    # _fix_invalid_backslash_escapes). This model can also emit a
-    # ThinkingBlock ahead of the visible text (see _extract_response_text)
-    # whose tokens count against the same max_tokens budget, leaving less
-    # room than expected for the actual JSON reply. Raised with real margin.
+    # ROOT CAUSE, found after two rounds of real truncation bugs (AMZN, then
+    # NVDA again even after raising max_tokens 300 -> 1024): per Anthropic's
+    # docs, Claude Sonnet 5 uses adaptive thinking that's ON BY DEFAULT with
+    # no `thinking` config needed, and its thinking tokens count against the
+    # same max_tokens budget as the visible reply -- explaining both the
+    # ThinkingBlock content we found earlier (_extract_response_text) and
+    # why a short ~370-char JSON reply could still get cut off mid-string at
+    # max_tokens=1024: the model was spending an unpredictable share of that
+    # budget on invisible reasoning before ever emitting the JSON. This is a
+    # simple single-shot classification task with no need for step-by-step
+    # reasoning, so thinking is turned off outright rather than just raising
+    # max_tokens again and hoping the next headline set doesn't need more
+    # thinking than that guess allows.
     response = client.messages.create(
         model=model,
         max_tokens=1024,
         system=_SYSTEM_PROMPT,
+        thinking={"type": "disabled"},
         messages=[{"role": "user", "content": user_prompt}],
     )
     response_text = _extract_response_text(response)

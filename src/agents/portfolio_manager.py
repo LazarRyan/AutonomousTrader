@@ -293,17 +293,22 @@ def propose_candidate_trades(
     client = anthropic.Anthropic(api_key=anthropic_api_key)
     user_prompt = build_portfolio_manager_prompt(blended_scores, portfolio)
 
-    # Raised defensively alongside the identical fix in news_sentiment.py's
-    # score_news_sentiment -- that function's max_tokens=300 was confirmed
-    # too low in practice (two real responses truncated mid-JSON), and this
-    # call shares the same model and the same invisible-ThinkingBlock-eats-
-    # the-budget risk (see _extract_response_text). This function proposes
-    # trades for potentially many symbols per cycle, so it gets more
-    # headroom than the single-symbol sentiment call.
+    # thinking disabled outright -- see the identical, root-caused fix and
+    # full explanation in news_sentiment.py's score_news_sentiment. Claude
+    # Sonnet 5 uses adaptive thinking that's on by default (confirmed via
+    # Anthropic's docs) and its thinking tokens eat into the same max_tokens
+    # budget as the visible JSON reply, which caused two real truncation
+    # bugs in the sibling call. This is a structured trade-proposal task,
+    # not one requiring step-by-step reasoning the deterministic risk/safety
+    # layers downstream don't already re-verify, so disabling is safe here
+    # too. max_tokens raised from 1000 defensively -- proposes trades across
+    # potentially many symbols per cycle, so gets more headroom than the
+    # single-symbol sentiment call even with thinking off.
     response = client.messages.create(
         model=model,
         max_tokens=2048,
         system=_SYSTEM_PROMPT,
+        thinking={"type": "disabled"},
         messages=[{"role": "user", "content": user_prompt}],
     )
     response_text = _extract_response_text(response)
