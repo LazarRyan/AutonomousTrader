@@ -326,9 +326,28 @@ Digitally Signed: Hon. Nancy Pelosi , 01/23/2026
         assert dis.amount_high == 5_000_000.0
 
 
+def _senate_pdf_row(row_num: int, txn_date: str, owner: str, ticker: str, asset_lines: list[str], asset_type: str, txn_type_lines: list[str], amount_lines: list[str], comment: str = "--") -> str:
+    """Builds a realistic multi-line Senate PTR row the way pdfplumber's
+    extract_text() actually renders it -- the row number and date lead the
+    row, the asset name commonly wraps onto its own line(s), the asset type
+    and transaction type/amount can each wrap too (e.g. "Sale" then
+    "(Partial)" on the next line), and a comment placeholder ("--" when
+    there's no comment) follows. Mirrors the real Katie Britt PTR sample
+    used in TestParseSenatePtrTextRealFiling below.
+    """
+    lines = [f"{row_num} {txn_date} {owner} {ticker} {asset_lines[0]}"]
+    lines.extend(asset_lines[1:])
+    lines.append(f"{asset_type} {txn_type_lines[0]}")
+    lines.extend(txn_type_lines[1:])
+    lines.append(amount_lines[0])
+    lines.extend(amount_lines[1:])
+    lines.append(comment)
+    return "\n".join(lines)
+
+
 class TestParseSenatePtrText:
     def test_parses_a_clean_sale_row(self):
-        text = "01/15/2026 Self AAPL Apple Inc. Stock Sale (Full) $1,001 - $15,000"
+        text = _senate_pdf_row(1, "01/15/2026", "Self", "AAPL", ["Apple Inc."], "Stock", ["Sale", "(Full)"], ["$1,001 -", "$15,000"])
         result = parse_senate_ptr_text(text, "efd-123", "Jane Doe")
         assert len(result.transactions) == 1
         t = result.transactions[0]
@@ -337,16 +356,18 @@ class TestParseSenatePtrText:
         assert t.ticker == "AAPL"
         assert t.transaction_type == "sale_full"
         assert t.transaction_date == "2026-01-15"
+        assert result.flagged == []
 
     def test_parses_spouse_purchase(self):
-        text = "03/02/2026 Spouse MSFT Microsoft Corp Stock Purchase $15,001 - $50,000"
+        text = _senate_pdf_row(2, "03/02/2026", "Spouse", "MSFT", ["Microsoft Corp"], "Stock", ["Purchase"], ["$15,001 -", "$50,000"])
         result = parse_senate_ptr_text(text, "efd-124", "Jane Doe")
         t = result.transactions[0]
         assert t.owner == "SPOUSE"
         assert t.transaction_type == "purchase"
 
-    def test_unmatched_date_led_line_is_flagged(self):
-        text = "01/15/2026 Self AAPL Apple Inc. Weird Category Purchase $1,001 - $15,000"
+    def test_unmatched_asset_type_line_is_flagged(self):
+        # "Weird Category" isn't a valid asset type (Stock/Bond/Fund/Option/Other)
+        text = "1 01/15/2026 Self AAPL Apple Inc. Weird Category Purchase $1,001 - $15,000"
         result = parse_senate_ptr_text(text, "efd-125", "Jane Doe")
         assert result.transactions == []
         assert len(result.flagged) == 1
@@ -357,6 +378,224 @@ class TestParseSenatePtrText:
         assert result.transactions == []
         assert result.flagged == []
 
+    def test_boilerplate_lines_are_ignored_not_flagged(self):
+        text = "\n".join(
+            [
+                "United States Senate",
+                "Financial Disclosures",
+                "Periodic Transaction Report for 01/26/2026",
+                "Mrs. Jane Doe (Doe, Jane)",
+                " Filed 01/26/2026 @ 5:46 PM",
+                "The following statements were checked before filing:",
+                "I certify that the statements I have made on this form are true, complete and correct to the best of",
+                "my knowledge and belief.",
+                "I understand that reports cannot be edited once filed. To make corrections, I will submit an",
+                "electronic amendment to this report.",
+                " Transactions (0 transactions total) 0 Self 0 Joint 0 Spouse 0 Dependent Child",
+                "#",
+                "Transaction Date Owner Ticker Asset Name",
+                "Asset",
+                "Type Type Amount Comment",
+            ]
+        )
+        result = parse_senate_ptr_text(text, "efd-127", "Jane Doe")
+        assert result.transactions == []
+        assert result.flagged == []
+
+    def test_multiple_rows_mixed_clean_and_flagged(self):
+        good1 = _senate_pdf_row(3, "01/15/2026", "Self", "AAPL", ["Apple Inc."], "Stock", ["Purchase"], ["$1,001 -", "$15,000"])
+        good2 = _senate_pdf_row(2, "03/02/2026", "Spouse", "MSFT", ["Microsoft Corp"], "Stock", ["Sale", "(Partial)"], ["$15,001 -", "$50,000"])
+        bad = "1 01/01/2026 Self XX Some Garbage Corp Weird Category Purchase $5.00"
+        text = "\n".join([good1, bad, good2])
+        result = parse_senate_ptr_text(text, "efd-128", "Jane Doe")
+        assert len(result.transactions) == 2
+        assert len(result.flagged) == 1
+
+
+class TestParseSenatePtrTextRealFiling:
+    """Validated against a real, live-fetched Senate PTR filing (Sen. Katie
+    Britt, filed 01/26/2026, fetched via a public mirror of the PDF served
+    by efdsearch.senate.gov -- efdsearch itself requires an interactive
+    terms-acceptance session that couldn't be completed from this
+    environment, but the underlying PDF and its pdfplumber-style extracted
+    text are real). This is the actual extracted text, boilerplate, row
+    numbers, and line-wraps included -- not a synthetic approximation. See
+    CALIBRATION STATUS in congressional.py.
+    """
+
+    REAL_FILING_TEXT = """United States Senate
+Financial Disclosures
+Periodic Transaction Report for 01/26/2026
+Mrs. Katie Britt (Britt, Katie)
+ Filed 01/26/2026 @ 5:46 PM
+The following statements were checked before filing:
+I certify that the statements I have made on this form are true, complete and correct to the best of
+my knowledge and belief.
+I understand that reports cannot be edited once filed. To make corrections, I will submit an
+electronic amendment to this report.
+ Transactions (22 transactions total) 0 Self 0 Joint 22 Spouse 0 Dependent Child
+#
+Transaction Date Owner Ticker Asset Name
+Asset
+Type Type Amount Comment
+22 04/14/2025 Spouse XOM Exxon Mobil
+Corp
+Stock Purchase $1,001 -
+$15,000
+--
+21 04/14/2025 Spouse JPM JP Morgan
+Chase &
+Company
+Stock Purchase $1,001 -
+$15,000
+--
+20 04/14/2025 Spouse GOOG Alphabet Cl
+C
+Stock Purchase $1,001 -
+$15,000
+--
+19 04/14/2025 Spouse EOG EOG
+Resources,
+Inc.
+Common
+Stock
+Stock Purchase $1,001 -
+$15,000
+--
+18 04/14/2025 Spouse AAPL Apple Inc Stock Purchase $1,001 -
+$15,000
+--
+17 04/14/2025 Spouse AMZN Amazon.com
+Inc
+Stock Purchase $1,001 -
+$15,000
+--
+16 04/14/2025 Spouse WMT Walmart Inc Stock Purchase $1,001 -
+$15,000
+--
+15 04/14/2025 Spouse V Visa Inc Stock Purchase $1,001 -
+$15,000
+--
+14 04/14/2025 Spouse MSFT Microsoft
+Corp
+Stock Purchase $1,001 -
+$15,000
+--
+13 04/14/2025 Spouse UNH Unitedhealth
+Group Inc
+Stock Purchase $1,001 -
+$15,000
+--
+12 04/14/2025 Spouse NVDA Nvidia Corp Stock Purchase $1,001 -
+$15,000
+--
+11 04/30/2025 Spouse Amazon.com Stock Purchase $1,001 - --
+AMZN Inc $15,000
+10 04/30/2025 Spouse AAPL Apple Inc Stock Purchase $1,001 -
+$15,000
+--
+9 04/30/2025 Spouse UNH Unitedhealth
+Group Inc
+Stock Sale
+(Full)
+$1,001 -
+$15,000
+--
+8 04/30/2025 Spouse NVDA Nvidia Corp Stock Purchase $1,001 -
+$15,000
+--
+7 04/30/2025 Spouse XOM Exxon Mobil
+Corp
+Stock Sale
+(Full)
+$1,001 -
+$15,000
+--
+6 11/07/2025 Spouse NVDA Nvidia Corp Stock Sale
+(Partial)
+$1,001 -
+$15,000
+--
+5 11/07/2025 Spouse AAPL Apple Inc Stock Sale
+(Partial)
+$1,001 -
+$15,000
+--
+4 11/07/2025 Spouse GOOG Alphabet Cl
+C
+Stock Sale
+(Partial)
+$1,001 -
+$15,000
+--
+3 11/07/2025 Spouse UPS United
+Parcel
+Service
+Stock Purchase $1,001 -
+$15,000
+--
+2 11/07/2025 Spouse AMZN Amazon.com
+Inc
+Stock Sale
+(Partial)
+$1,001 -
+$15,000
+--
+1 11/07/2025 Spouse V Visa Inc Stock Purchase $1,001 -
+$15,000
+--
+"""
+
+    def test_parses_21_of_22_real_transactions(self):
+        result = parse_senate_ptr_text(self.REAL_FILING_TEXT, "britt-2026-01-26", "Katie Britt")
+        assert len(result.transactions) == 21
+
+    def test_the_one_page_break_split_row_is_flagged_not_silently_dropped(self):
+        # Transaction #11 (an AMZN purchase) has its ticker land after the
+        # comment placeholder on a wrapped line in the real extracted text
+        # -- it must show up as flagged, not vanish and not get merged into
+        # an adjacent transaction's fields.
+        result = parse_senate_ptr_text(self.REAL_FILING_TEXT, "britt-2026-01-26", "Katie Britt")
+        assert len(result.flagged) == 1
+        assert "11" in result.flagged[0].raw_line
+        assert "04/30/2025" in result.flagged[0].raw_line
+
+    def test_no_transaction_silently_absorbs_another_transactions_fields(self):
+        result = parse_senate_ptr_text(self.REAL_FILING_TEXT, "britt-2026-01-26", "Katie Britt")
+        for t in result.transactions:
+            assert len(t.asset_name) < 60  # sanity bound -- no runaway match absorbing multiple rows
+
+    def test_all_owner_codes_correctly_attributed_to_spouse(self):
+        # Every transaction in this real filing is spousal -- if the
+        # boundary regex regresses, these would silently default to
+        # something else, which is a real correctness bug, not cosmetic.
+        result = parse_senate_ptr_text(self.REAL_FILING_TEXT, "britt-2026-01-26", "Katie Britt")
+        assert all(t.owner == "SPOUSE" for t in result.transactions)
+
+    def test_known_tickers_and_amounts_parsed_correctly(self):
+        result = parse_senate_ptr_text(self.REAL_FILING_TEXT, "britt-2026-01-26", "Katie Britt")
+        by_ticker_and_date = {(t.ticker, t.transaction_date, t.transaction_type): t for t in result.transactions}
+
+        xom = by_ticker_and_date[("XOM", "2025-04-14", "purchase")]
+        assert xom.amount_low == 1_001.0
+        assert xom.amount_high == 15_000.0
+
+        unh_sale = by_ticker_and_date[("UNH", "2025-04-30", "sale_full")]
+        assert unh_sale.amount_low == 1_001.0
+
+        nvda_partial = by_ticker_and_date[("NVDA", "2025-11-07", "sale_partial")]
+        assert nvda_partial.amount_high == 15_000.0
+
+    def test_wrapped_asset_name_containing_the_word_stock_still_parses(self):
+        # EOG's asset name is "EOG Resources, Inc. Common Stock" -- the
+        # literal word "Stock" appearing inside the asset name (before the
+        # real Asset Type column, which is also "Stock") is a real
+        # ambiguity in this filing and a good regression guard for the
+        # asset_name/asset_type boundary.
+        result = parse_senate_ptr_text(self.REAL_FILING_TEXT, "britt-2026-01-26", "Katie Britt")
+        eog = next(t for t in result.transactions if t.ticker == "EOG")
+        assert eog.asset_name == "EOG Resources, Inc. Common Stock"
+
 
 class TestParsePtrTextDispatch:
     def test_dispatches_to_house(self):
@@ -365,7 +604,7 @@ class TestParsePtrTextDispatch:
         assert result.transactions[0].chamber == "house"
 
     def test_dispatches_to_senate(self):
-        text = "01/15/2026 Self AAPL Apple Inc. Stock Purchase $1,001 - $15,000"
+        text = "1 01/15/2026 Self AAPL Apple Inc. Stock Purchase $1,001 - $15,000"
         result = parse_ptr_text(text, "senate", "doc2", "Jane Doe")
         assert result.transactions[0].chamber == "senate"
 

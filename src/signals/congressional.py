@@ -38,18 +38,27 @@ CALIBRATION STATUS:
     reconstructs each transaction from the remaining text (which still has
     multi-line-wrapped table cells -- asset names and amount ranges commonly
     wrap across the original PDF's line breaks).
-  - Senate (parse_senate_ptr_text): NOT YET validated against a live filing
-    -- efdsearch.senate.gov requires an interactive session/terms-acceptance
-    flow this environment couldn't complete, so no real Senate PTR sample
-    was available. Built from the well-documented public layout (same one
-    senate-stock-watcher uses), but treat it as unverified until tested
-    against a real fetched filing.
+  - Senate (parse_senate_ptr_text): VALIDATED against a real filing (Sen.
+    Katie Britt's PTR filed 01/26/2026, fetched live -- 22 real spousal
+    stock transactions across AAPL, AMZN, GOOG, MSFT, NVDA, UNH, UPS, V,
+    WMT, XOM, JPM, EOG). It correctly parsed 21 of 22 real transaction line
+    items; the 22nd (an AMZN purchase) was split across a PDF page/line
+    boundary by pdfplumber's text extraction -- the ticker landed after the
+    comment placeholder on a wrapped line instead of next to the asset name
+    -- and was correctly flagged rather than mis-parsed or silently
+    dropped. This confirmed the originally-assumed layout (bare "date owner
+    ticker asset-name type amount" all on one line) was WRONG for the real
+    site: actual rows are prefixed by a row number, and asset names/amounts/
+    transaction-type annotations wrap across multiple lines exactly like
+    the House filings do. The parser was reworked to use the same clean/
+    blob/reconstruct strategy as parse_house_ptr_text() as a direct result
+    of this calibration.
 
-KNOWN LIMITATION (House): a transaction row that gets split across a PDF
-page boundary can have its fields extracted in a scrambled order (e.g. the
-ticker and closing amount end up on the far side of a page-break, after
-unrelated header text that repeats at the top of the next page). When this
-happens, the transaction fails to match the expected pattern and is
+KNOWN LIMITATION (both chambers): a transaction row that gets split across
+a PDF page or line boundary can have its fields extracted in a scrambled
+order (e.g. a ticker and closing amount end up after a comment placeholder
+or unrelated header text that repeats at the top of the next page). When
+this happens, the transaction fails to match the expected pattern and is
 correctly flagged rather than guessed at -- this is the intended "skip and
 flag" behavior working as designed, not a bug to silently paper over. It
 does mean a small number of real transactions (page-break casualties) will
@@ -306,17 +315,53 @@ def parse_house_ptr_text(text: str, source_doc_id: str, filer_name: str) -> Pars
     return ParseResult(transactions=transactions, flagged=flagged)
 
 
-# Senate PTR row, e.g.:
-#   "01/15/2026 Self AAPL Apple Inc. Stock Purchase $1,001 - $15,000"
-#   "03/02/2026 Spouse MSFT Microsoft Corp Stock Sale (Partial) $15,001 - $50,000"
-_SENATE_ROW_RE = re.compile(
-    r"^(?P<txn_date>\d{2}/\d{2}/\d{4})\s+"
+# Senate PTR, reconstructed from the real (messy) extracted PDF text -- see
+# CALIBRATION STATUS in the module docstring. Like the House filing, this is
+# NOT matched line-by-line: pdfplumber wraps the asset name, dollar amounts,
+# and even the transaction-type ("Sale" / "(Partial)") across separate
+# lines, and each row is prefixed by its own row number (descending from the
+# total transaction count) rather than starting directly with the date.
+# _clean_senate_text() strips known boilerplate/header/footer lines first,
+# then joins everything else with single spaces into one blob, and this
+# pattern is matched against that blob with re.finditer (not anchored to
+# line start/end) -- same structure as _HOUSE_TRANSACTION_RE.
+_SENATE_NOISE_LINE_PATTERNS = [
+    r"^United States Senate$",
+    r"^Financial Disclosures$",
+    r"^Periodic Transaction Report for ",
+    r"^(Mr\.|Mrs\.|Ms\.|Dr\.|The Honorable)\s",
+    r"^\s*Filed \d{2}/\d{2}/\d{4} @",
+    r"^The following statements were checked before filing:$",
+    r"^I certify that the statements I have made on this form are true, complete and correct to the best of$",
+    r"^my knowledge and belief\.$",
+    r"^I understand that reports cannot be edited once filed\. To make corrections, I will submit an$",
+    r"^electronic amendment to this report\.$",
+    r"^\s*Transactions \(\d+ transactions? total\)",
+    r"^#$",
+    r"^Transaction Date Owner Ticker Asset Name$",
+    r"^Asset$",
+    r"^Type Type Amount Comment$",
+    r"^eFD: Print Periodic Transaction Report",
+    r"Page \d+ of \d+$",
+]
+_SENATE_SKIP_LINE_RE = [re.compile(p) for p in _SENATE_NOISE_LINE_PATTERNS]
+
+# asset_name is restricted to [^$] (never crosses a dollar sign) -- without
+# this, a malformed row earlier in the blob (e.g. one with an unrecognized
+# asset type) can get silently absorbed straight through into a LATER
+# transaction's fields, stealing its ticker/date/amount instead of failing
+# to match and being flagged. Same fix, same reason, as _HOUSE_TRANSACTION_RE
+# -- verified with a regression test built from a real absorption bug found
+# during calibration against this parser's first real-filing test run.
+_SENATE_TRANSACTION_RE = re.compile(
+    r"(?P<row_num>\d{1,3})\s+"
+    r"(?P<txn_date>\d{2}/\d{2}/\d{4})\s+"
     r"(?P<owner>Self|Spouse|Joint|Dependent Child)\s+"
     r"(?P<ticker>[A-Z]{1,6}(?:\.[A-Z]{1,2})?)\s+"
-    r"(?P<asset_name>.+?)\s+"
-    r"(?:Stock|Bond|Fund|Option|Other)\s+"
+    r"(?P<asset_name>[^$]{1,120}?)\s+"
+    r"(?P<asset_type>Stock|Bond|Fund|Option|Other)\s+"
     r"(?P<txn_type>Purchase|Sale \(Full\)|Sale \(Partial\)|Exchange)\s+"
-    r"(?P<amount>Over \$[\d,]+|\$[\d,]+\s*-\s*\$[\d,]+)\s*$"
+    r"(?P<amount>\$[\d,]+\s*-\s*\$[\d,]+|Over \$[\d,]+)"
 )
 
 _SENATE_OWNER_MAP = {
@@ -333,41 +378,48 @@ _SENATE_TXN_TYPE_MAP = {
     "Exchange": "exchange",
 }
 
+# Matches a "<row#> <date> <owner>" occurrence, independent of whether a
+# full transaction around it matched -- used to find rows that LOOKED like
+# they were starting a transaction but didn't fully match (most commonly a
+# row mangled by a PDF page break, e.g. the ticker landing after the
+# comment placeholder on a wrapped line), so they get flagged instead of
+# silently vanishing. Same purpose as _HOUSE_ANCHOR_RE.
+_SENATE_ROW_ANCHOR_RE = re.compile(r"\d{1,3}\s+\d{2}/\d{2}/\d{4}\s+(?:Self|Spouse|Joint|Dependent Child)\b")
 
-def parse_senate_ptr_text(text: str, source_doc_id: str, filer_name: str) -> ParseResult:
-    """Parse the extracted text of one Senate PTR PDF into transactions.
-    Same skip-and-flag discipline as parse_house_ptr_text()."""
-    transactions: list[CongressionalTransaction] = []
-    flagged: list[FlaggedLine] = []
 
-    looks_like_row = re.compile(r"^\d{2}/\d{2}/\d{4}\s+\S")
-
+def _clean_senate_text(text: str) -> str:
+    clean_lines = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-
-        match = _SENATE_ROW_RE.match(line)
-        if not match:
-            if looks_like_row.match(line):
-                flagged.append(
-                    FlaggedLine(
-                        chamber="senate",
-                        source_doc_id=source_doc_id,
-                        raw_line=line,
-                        reason="line resembles a transaction row but did not match the expected Senate PTR format",
-                    )
-                )
+        if any(pattern.search(line) for pattern in _SENATE_SKIP_LINE_RE):
             continue
+        clean_lines.append(line)
+    return " ".join(clean_lines)
 
+
+def parse_senate_ptr_text(text: str, source_doc_id: str, filer_name: str) -> ParseResult:
+    """Parse the extracted text of one Senate PTR PDF into transactions.
+    See CALIBRATION STATUS in the module docstring -- validated against a
+    real filing. Same skip-and-flag discipline, and the same clean/blob/
+    reconstruct strategy, as parse_house_ptr_text()."""
+    transactions: list[CongressionalTransaction] = []
+    flagged: list[FlaggedLine] = []
+
+    cleaned = _clean_senate_text(text)
+    matches = list(_SENATE_TRANSACTION_RE.finditer(cleaned))
+    covered_spans = [(m.start(), m.end()) for m in matches]
+
+    for match in matches:
         amount = _parse_amount_range(match.group("amount"))
         if amount is None:
             flagged.append(
                 FlaggedLine(
                     chamber="senate",
                     source_doc_id=source_doc_id,
-                    raw_line=line,
-                    reason=f"unrecognized amount range format: {match.group('amount')!r}",
+                    raw_line=match.group(0),
+                    reason=f"unrecognized amount format: {match.group('amount')!r}",
                 )
             )
             continue
@@ -385,7 +437,25 @@ def parse_senate_ptr_text(text: str, source_doc_id: str, filer_name: str) -> Par
                 transaction_date=_parse_date_mmddyyyy(match.group("txn_date")),
                 amount_low=amount_low,
                 amount_high=amount_high,
-                raw_line=line,
+                raw_line=match.group(0),
+            )
+        )
+
+    # Anything that looked like it was starting a transaction (a row number
+    # + date + owner anchor) but isn't covered by a successful match above
+    # gets flagged with surrounding context, never silently dropped.
+    for anchor in _SENATE_ROW_ANCHOR_RE.finditer(cleaned):
+        already_covered = any(start <= anchor.start() < end for start, end in covered_spans)
+        if already_covered:
+            continue
+        context_start = max(0, anchor.start() - 40)
+        context_end = min(len(cleaned), anchor.end() + 100)
+        flagged.append(
+            FlaggedLine(
+                chamber="senate",
+                source_doc_id=source_doc_id,
+                raw_line=cleaned[context_start:context_end].strip(),
+                reason="transaction anchor found but full row did not match the expected format (commonly a PDF page-break split)",
             )
         )
 
