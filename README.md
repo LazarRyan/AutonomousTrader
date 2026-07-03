@@ -19,12 +19,13 @@ only supported mode. Live trading requires a distinct `TRADING_MODE=live`
 env var *and* a manual confirmation step in the execution agent that does
 not exist yet and will be built as its own deliberate second phase.
 
-## Status: end-to-end pipeline built, credentials in place, not yet run live
+## Status: end-to-end pipeline built and verified, not yet run live
 
 Every stage of the architecture (signals -> blending -> portfolio manager ->
 risk scoring -> execution/approval -> audit log) is implemented and covered
-by unit tests (172 passing, 6 more gated behind a real `ANTHROPIC_API_KEY`).
-What's built:
+by unit tests: 180 passing, plus 6 more gated behind a real
+`ANTHROPIC_API_KEY` -- all 6 have now been confirmed passing against the
+real Anthropic API (see "Credentials" below). What's built:
 
 - Supabase schema (`supabase/schema.sql`): `holdings`, `signals`,
   `candidate_trades`, `executed_trades`, `approval_queue`, `audit_log`,
@@ -44,17 +45,28 @@ What's built:
 - `src/signals/insider_edgar.py` -- SEC EDGAR Form 4 parsing + weighted
   composite score. Fully tested with fixture XML.
 - `src/signals/congressional.py` -- House/Senate PTR parsing with
-  skip-and-flag discipline. **House parser validated against a real, live-
-  fetched filing** (Rep. Pelosi's PTR #20033725): 17 of 18 real transactions
-  parsed correctly, the 18th (a row mangled by a PDF page break) correctly
-  flagged rather than mis-parsed. **Senate parser is still unvalidated** --
-  efdsearch.senate.gov's interactive session/terms-acceptance flow couldn't
-  be completed from this environment, so no real Senate sample was available.
+  skip-and-flag discipline. **Both parsers validated against real, live-
+  fetched filings.** House: Rep. Pelosi's PTR #20033725, 17 of 18 real
+  transactions parsed correctly, the 18th (a row mangled by a PDF page
+  break) correctly flagged rather than mis-parsed. Senate: Sen. Katie
+  Britt's PTR filed 01/26/2026 (fetched via a public PDF mirror, since
+  efdsearch.senate.gov's interactive terms-acceptance session couldn't be
+  completed from this environment), 21 of 22 real transactions parsed
+  correctly, the 22nd (page-break-scrambled) correctly flagged. The
+  Senate parser's original single-line-per-row layout assumption turned
+  out to be wrong once tested against real data (real rows wrap across
+  multiple lines, same as House) and was reworked accordingly -- a genuine
+  bug caught by validation, not a hypothetical.
 - `src/signals/news_sentiment.py` -- Anthropic-based sentiment scoring.
-  Prompt/parsing logic tested; a fixture-headline direction test exists but
-  is skipped without a real API key.
+  Prompt/parsing logic tested; the fixture-headline direction test (gated
+  on `ANTHROPIC_API_KEY`) has been run against the real API and passes.
+  Fixed a real bug found by that run: the response's first content block
+  can be a `ThinkingBlock` rather than text, and the model can append
+  stray commentary after the JSON payload -- both now handled.
 - `src/agents/portfolio_manager.py` -- blended-signal scoring (tested) +
-  LLM trade proposals (fixture-scenario test gated on API key).
+  LLM trade proposals. The fixture-scenario test (gated on
+  `ANTHROPIC_API_KEY`) has been run against the real API and passes, after
+  the same `ThinkingBlock`/trailing-JSON fixes as news_sentiment.py.
 - `src/agents/execution.py` -- the only module that places orders. Trading-
   mode gate, safety-rail gate, and order placement all have full
   control-flow test coverage via dependency injection.
@@ -67,23 +79,23 @@ What's built:
   itself is thin glue over the tested pieces, same as every other
   network-touching module in this project.
 
-**Credentials:** `.env` has real Supabase, Anthropic, and Alpaca API-key
-values in place (Alpaca secret key still needed -- Alpaca issues API key
-and secret as a pair). These secrets passed through this chat session's
-transcript at some point during setup -- worth rotating all three once
-everything's confirmed working, since a chat log isn't a secure long-term
-home for live credentials.
+**Credentials:** `.env` has real Supabase, Anthropic, and Alpaca (paper)
+API-key values in place, and all three have been **verified working from
+your own machine** -- Supabase query returned real data, Alpaca account
+check showed `AccountStatus.ACTIVE`, Anthropic call returned `OK`, and the
+6 previously-gated fixture tests pass against the real Anthropic API.
+These secrets passed through this chat session's transcript at some point
+during setup -- still worth rotating all three at some point, since a chat
+log isn't a secure long-term home for live credentials, but nothing is
+blocking on it.
 
 **Not yet done before this can run for real:**
-- Add the missing `ALPACA_SECRET_KEY` to `.env`.
-- Validate the Senate PTR parser against a real filing (blocked so far by
-  efdsearch.senate.gov's session/terms flow -- may need a real browser
-  session rather than a scripted fetch).
-- Nothing has been run against a live paper account yet, and this sandboxed
-  environment's network is allowlisted in a way that blocks direct calls to
-  Supabase's and Anthropic's APIs -- so even the credentials above haven't
-  been connectivity-tested from here. The first real end-to-end run needs
-  to happen on your own machine.
+- Nothing has been run against a live paper account yet -- the first real
+  `run_cycle()` against your actual paper account and the full S&P 500
+  universe is the natural next milestone.
+- This sandboxed development environment's network is allowlisted in a way
+  that blocks direct calls to Supabase, Anthropic, and Alpaca -- so all
+  connectivity testing above happened on your machine, not this one.
 
 ## Setup
 
