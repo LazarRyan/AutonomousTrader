@@ -402,9 +402,22 @@ def run_cycle(
         print(f"Cycle skipped: benchmark volatility unavailable ({exc})")
         return
 
+    # Real bug found on a live dry run: TradingClient (the ORDER-placement
+    # client, used everywhere else in this function) has no
+    # get_latest_quote method at all -- quotes come from Alpaca's separate
+    # market-data API via StockHistoricalDataClient. Built once here and
+    # reused across the proposal loop, same reasoning as the benchmark
+    # volatility fetch above (no reason to reconstruct a client 500 times).
+    from alpaca.data.enums import DataFeed
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockLatestQuoteRequest
+
+    market_data_client = StockHistoricalDataClient(settings.alpaca_api_key, settings.alpaca_secret_key)
+
     for proposal in proposals:
         try:
-            quote = alpaca_trading_client.get_latest_quote(proposal.symbol)
+            quote_request = StockLatestQuoteRequest(symbol_or_symbols=proposal.symbol, feed=DataFeed.IEX)
+            quote = market_data_client.get_stock_latest_quote(quote_request)[proposal.symbol]
             proposed_price = float(quote.ask_price or quote.bid_price)
         except Exception as exc:  # noqa: BLE001
             log_audit(
