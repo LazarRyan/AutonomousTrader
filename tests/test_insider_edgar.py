@@ -5,6 +5,7 @@ from src.signals.insider_edgar import (
     InsiderTransaction,
     compute_insider_signal,
     parse_form4_xml,
+    raw_form4_document_url,
 )
 
 
@@ -227,3 +228,37 @@ class TestComputeInsiderSignal:
         assert result.net_weighted_dollar_value == pytest.approx(90_000.0)
         assert result.num_buy_transactions == 1
         assert result.num_sell_transactions == 1
+
+
+class TestRawForm4DocumentUrl:
+    """Regression tests for a real bug found via a live dry run: SEC's
+    submissions API returned primaryDocument="xslF345X06/form4.xml" for a
+    real AAPL Form 4 filing (accession 0001140361-26-025622). Requesting
+    that exact path returned SEC's XSLT-rendered HTML view of the form (a
+    real, well-formed HTML document -- not an error page), not the raw XML
+    -- which is what caused parse_form4_xml to fail with a "mismatched tag"
+    ElementTree error. See raw_form4_document_url()'s docstring."""
+
+    def test_strips_xsl_rendering_prefix_from_primary_document(self):
+        # Real values from the filing that surfaced this bug.
+        url = raw_form4_document_url("0000320193", "0001140361-26-025622", "xslF345X06/form4.xml")
+        assert url == "https://www.sec.gov/Archives/edgar/data/320193/000114036126025622/form4.xml"
+        assert "xslF345X06" not in url
+
+    def test_bare_filename_with_no_prefix_is_unaffected(self):
+        # Not every filing's primaryDocument has an xsl-rendering prefix --
+        # confirm the common case still works unchanged.
+        url = raw_form4_document_url("0000320193", "0001140361-26-025622", "primary_doc.xml")
+        assert url.endswith("/primary_doc.xml")
+
+    def test_accession_dashes_are_stripped(self):
+        url = raw_form4_document_url("0000320193", "0001140361-26-025622", "form4.xml")
+        assert "0001140361-26-025622" not in url
+        assert "000114036126025622" in url
+
+    def test_leading_zero_cik_is_rendered_without_them_in_the_url(self):
+        # SEC's Archives host uses the CIK as a plain integer in the URL
+        # path, not the zero-padded 10-digit form used elsewhere (e.g. the
+        # submissions API's CIK{cik}.json endpoint).
+        url = raw_form4_document_url("0000320193", "0001140361-26-025622", "form4.xml")
+        assert "/data/320193/" in url

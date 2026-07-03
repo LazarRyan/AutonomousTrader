@@ -29,6 +29,17 @@ real-world filings; a document with multiple reporting owners will have its
 relationship flags (officer/director/10%-owner) attributed to the first
 listed owner. Both simplifications are intentional for a first pass, not
 oversights -- documented here for whoever backtests this next.
+
+CALIBRATION NOTE: a real bug was found and fixed via a live dry run against
+a real AAPL Form 4 filing -- fetch_form4_document was building its URL
+directly from the submissions API's primaryDocument field, which is
+sometimes an "xslF345X0N/<filename>" path. That path returns SEC's
+XSLT-transformed HTML rendering of the form (real HTML content, despite
+the ".xml" extension), not the raw XML -- which is exactly what produced
+the "mismatched tag" ElementTree errors. See raw_form4_document_url()'s
+docstring for the fix (strip the "xslXXXX/" prefix) and
+tests/test_insider_edgar.py's TestRawForm4DocumentUrl for the regression
+tests built from that real filing's actual field values.
 """
 
 from __future__ import annotations
@@ -352,14 +363,32 @@ def fetch_recent_form4_accessions(
     return results
 
 
+def raw_form4_document_url(cik: str, accession_number: str, primary_document: str) -> str:
+    """Build the URL for a filing's RAW XML document.
+
+    SEC's submissions API sometimes returns primaryDocument as an
+    "xslF345X0N/<filename>" path (e.g. "xslF345X06/form4.xml") -- confirmed
+    against a real AAPL Form 4 filing during a live dry run. Requesting
+    that exact path from the Archives host returns SEC's dynamically
+    XSLT-transformed HUMAN-READABLE rendering (genuine HTML content --
+    "<!DOCTYPE html ... <html><head>..." -- despite the .xml extension in
+    the URL), which is not parseable as the ownershipDocument XML this
+    module needs, and was the actual root cause of the "mismatched tag"
+    ElementTree errors seen in that dry run. The real raw XML always lives
+    directly in the accession folder under its bare filename (no
+    "xslXXXX/" subdirectory), so that prefix is stripped here. Pure string
+    logic -- unit-tested, no network.
+    """
+    filename = primary_document.rsplit("/", 1)[-1]
+    accession_no_dashes = accession_number.replace("-", "")
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_no_dashes}/{filename}"
+
+
 def fetch_form4_document(cik: str, accession_number: str, primary_document: str, user_agent: str) -> str:
     """Fetch the raw Form 4 XML for one filing."""
     import urllib.request
 
-    accession_no_dashes = accession_number.replace("-", "")
-    url = (
-        f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_no_dashes}/{primary_document}"
-    )
+    url = raw_form4_document_url(cik, accession_number, primary_document)
     request = urllib.request.Request(url, headers={"User-Agent": user_agent})
     with urllib.request.urlopen(request, timeout=15) as response:
         return response.read().decode("utf-8")
