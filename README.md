@@ -19,11 +19,11 @@ only supported mode. Live trading requires a distinct `TRADING_MODE=live`
 env var *and* a manual confirmation step in the execution agent that does
 not exist yet and will be built as its own deliberate second phase.
 
-## Status: end-to-end pipeline built, not yet run live
+## Status: end-to-end pipeline built, credentials in place, not yet run live
 
 Every stage of the architecture (signals -> blending -> portfolio manager ->
 risk scoring -> execution/approval -> audit log) is implemented and covered
-by unit tests (147 passing, 6 more gated behind a real `ANTHROPIC_API_KEY`).
+by unit tests (172 passing, 6 more gated behind a real `ANTHROPIC_API_KEY`).
 What's built:
 
 - Supabase schema (`supabase/schema.sql`): `holdings`, `signals`,
@@ -31,14 +31,25 @@ What's built:
   `safety_state`, `config`. Applied to a dedicated Supabase project.
 - `src/risk/scorer.py` + `src/risk/safety_rails.py` -- deterministic
   composite risk score and non-negotiable safety rails. Fully tested.
+- `src/risk/market_data.py` -- real 30-day realized volatility and a
+  liquidity penalty from average daily dollar volume, computed from actual
+  Alpaca historical bars. Fully tested with synthetic price/volume series;
+  feeds the risk scorer in place of the earlier neutral placeholders.
+- `src/universe.py` + `data/sp500_constituents.csv` -- the real S&P 500
+  constituent list (with SEC CIKs bundled for the insider signal), sourced
+  from a maintained public dataset. `src/main.py` defaults to this list.
+  Refresh periodically with `scripts/refresh_sp500_universe.py`.
 - `src/signals/momentum.py` -- deterministic SMA crossover + RSI(14) + 10d
   ROC. Fully tested with synthetic price series.
 - `src/signals/insider_edgar.py` -- SEC EDGAR Form 4 parsing + weighted
   composite score. Fully tested with fixture XML.
 - `src/signals/congressional.py` -- House/Senate PTR parsing with
-  skip-and-flag discipline. **Parsing regexes are not yet validated against
-  a live-extracted PDF** -- see the calibration note in the module
-  docstring before relying on this signal.
+  skip-and-flag discipline. **House parser validated against a real, live-
+  fetched filing** (Rep. Pelosi's PTR #20033725): 17 of 18 real transactions
+  parsed correctly, the 18th (a row mangled by a PDF page break) correctly
+  flagged rather than mis-parsed. **Senate parser is still unvalidated** --
+  efdsearch.senate.gov's interactive session/terms-acceptance flow couldn't
+  be completed from this environment, so no real Senate sample was available.
 - `src/signals/news_sentiment.py` -- Anthropic-based sentiment scoring.
   Prompt/parsing logic tested; a fixture-headline direction test exists but
   is skipped without a real API key.
@@ -56,20 +67,23 @@ What's built:
   itself is thin glue over the tested pieces, same as every other
   network-touching module in this project.
 
+**Credentials:** `.env` has real Supabase, Anthropic, and Alpaca API-key
+values in place (Alpaca secret key still needed -- Alpaca issues API key
+and secret as a pair). These secrets passed through this chat session's
+transcript at some point during setup -- worth rotating all three once
+everything's confirmed working, since a chat log isn't a secure long-term
+home for live credentials.
+
 **Not yet done before this can run for real:**
-- Populate real Alpaca paper-trading keys (trading toolset) and a real
-  `ANTHROPIC_API_KEY` in `.env`.
-- Replace `DEFAULT_EXAMPLE_UNIVERSE` in `src/main.py` (5 tickers) with the
-  real S&P 500 constituent list -- sourcing and maintaining that list is
-  its own task, not done yet.
-- Validate the congressional PTR parser against real filings.
-- Real 30-day volatility and liquidity metrics feed the risk scorer with
-  neutral placeholders right now (see `run_cycle` in `src/main.py`) --
-  needs real historical-bar-based calculations before risk scores mean
-  anything.
-- Nothing has been run against a live paper account yet. Every "thin
-  wrapper" function that talks to Alpaca/EDGAR/House/Senate/Anthropic is
-  implemented but untested against the live network from this environment.
+- Add the missing `ALPACA_SECRET_KEY` to `.env`.
+- Validate the Senate PTR parser against a real filing (blocked so far by
+  efdsearch.senate.gov's session/terms flow -- may need a real browser
+  session rather than a scripted fetch).
+- Nothing has been run against a live paper account yet, and this sandboxed
+  environment's network is allowlisted in a way that blocks direct calls to
+  Supabase's and Anthropic's APIs -- so even the credentials above haven't
+  been connectivity-tested from here. The first real end-to-end run needs
+  to happen on your own machine.
 
 ## Setup
 
