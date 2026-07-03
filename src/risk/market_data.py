@@ -104,6 +104,7 @@ def fetch_bars_with_volume(
     """
     from datetime import datetime, timedelta, timezone
 
+    from alpaca.data.enums import DataFeed
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
@@ -112,7 +113,12 @@ def fetch_bars_with_volume(
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=int(lookback_days * 1.6) + 5)
 
-    request = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, start=start, end=end)
+    # feed=IEX explicitly -- see the identical comment in signals/momentum.py's
+    # fetch_daily_closes. alpaca-py defaults to SIP, which a basic/free
+    # market-data subscription cannot query for recent data.
+    request = StockBarsRequest(
+        symbol_or_symbols=symbol, timeframe=TimeFrame.Day, start=start, end=end, feed=DataFeed.IEX
+    )
     bars = client.get_stock_bars(request)
 
     df = bars.df

@@ -193,6 +193,7 @@ def fetch_daily_closes(symbol: str, api_key: str, secret_key: str, lookback_days
     """
     from datetime import datetime, timedelta, timezone
 
+    from alpaca.data.enums import DataFeed
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
@@ -202,7 +203,15 @@ def fetch_daily_closes(symbol: str, api_key: str, secret_key: str, lookback_days
     # Fetch extra calendar days to comfortably cover weekends/holidays.
     start = end - timedelta(days=int(lookback_days * 1.6) + 5)
 
-    request = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, start=start, end=end)
+    # feed=IEX explicitly -- alpaca-py defaults to the SIP feed, which a
+    # basic/free market-data subscription cannot query for recent data
+    # ("subscription does not permit querying recent SIP data", confirmed
+    # against a real account during the first live dry run). IEX is
+    # available on the free tier and is what this project's historical
+    # daily-bar signals were designed around.
+    request = StockBarsRequest(
+        symbol_or_symbols=symbol, timeframe=TimeFrame.Day, start=start, end=end, feed=DataFeed.IEX
+    )
     bars = client.get_stock_bars(request)
 
     df = bars.df

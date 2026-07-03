@@ -144,7 +144,11 @@ def fetch_recent_news(symbol: str, api_key: str, secret_key: str, limit: int = 2
     request = NewsRequest(symbols=symbol, limit=limit)
     response = client.get_news(request)
 
-    return [article.headline for article in response.news]
+    # alpaca-py's NewsSet stores articles at .data["news"], not a top-level
+    # .news attribute (confirmed against alpaca-py's actual NewsSet model --
+    # response.news raised AttributeError against a real account during the
+    # first live dry run).
+    return [article.headline for article in response.data["news"]]
 
 
 def _extract_response_text(response) -> str:
