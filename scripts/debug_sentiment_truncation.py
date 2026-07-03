@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import sys
 
+sys.path.insert(0, ".")  # allow `python scripts/debug_sentiment_truncation.py` from repo root
+
 from src.config import load_settings
 from src.signals.news_sentiment import _SYSTEM_PROMPT, build_sentiment_prompt, fetch_recent_news
 
