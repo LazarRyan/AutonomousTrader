@@ -120,7 +120,15 @@ def parse_sentiment_response(response_text: str) -> ParsedSentiment:
     try:
         payload, _ = json.JSONDecoder().raw_decode(text)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Sentiment response was not valid JSON: {response_text!r}") from exc
+        # A parse error whose position lands exactly at the end of the
+        # string (rather than somewhere in the middle) is the signature of
+        # a truncated response -- seen twice in practice (AMZN, NVDA) with
+        # max_tokens set too low. Surface that distinction rather than
+        # leaving it to be rediscovered by hand each time.
+        hint = ""
+        if exc.pos >= len(text):
+            hint = " (response appears truncated -- got cut off before valid JSON completed; consider raising max_tokens)"
+        raise ValueError(f"Sentiment response was not valid JSON{hint}: {response_text!r}") from exc
 
     if not isinstance(payload, dict) or "score" not in payload or "reasoning" not in payload:
         raise ValueError(f"Sentiment response missing required fields: {response_text!r}")
@@ -195,9 +203,17 @@ def score_news_sentiment(
     client = anthropic.Anthropic(api_key=anthropic_api_key)
     user_prompt = build_sentiment_prompt(symbol, headlines)
 
+    # max_tokens=300 was too low in practice: two separate real responses
+    # (AMZN, NVDA) were cut off mid-JSON, always right after the closing
+    # quote of "reasoning" but before the final "}" -- a genuine truncation,
+    # not an escaping issue (that's handled separately by
+    # _fix_invalid_backslash_escapes). This model can also emit a
+    # ThinkingBlock ahead of the visible text (see _extract_response_text)
+    # whose tokens count against the same max_tokens budget, leaving less
+    # room than expected for the actual JSON reply. Raised with real margin.
     response = client.messages.create(
         model=model,
-        max_tokens=300,
+        max_tokens=1024,
         system=_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
     )

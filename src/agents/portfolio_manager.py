@@ -220,7 +220,13 @@ def parse_portfolio_manager_response(response_text: str) -> list[CandidateTradeP
     try:
         payload, _ = json.JSONDecoder().raw_decode(text)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Portfolio manager response was not valid JSON: {response_text!r}") from exc
+        # See the identical hint in news_sentiment.py's parse_sentiment_response
+        # -- a parse error at the very end of the string means the response
+        # got cut off before valid JSON completed, not a formatting mistake.
+        hint = ""
+        if exc.pos >= len(text):
+            hint = " (response appears truncated -- got cut off before valid JSON completed; consider raising max_tokens)"
+        raise ValueError(f"Portfolio manager response was not valid JSON{hint}: {response_text!r}") from exc
 
     if not isinstance(payload, list):
         raise ValueError(f"Portfolio manager response must be a JSON array, got: {response_text!r}")
@@ -287,9 +293,16 @@ def propose_candidate_trades(
     client = anthropic.Anthropic(api_key=anthropic_api_key)
     user_prompt = build_portfolio_manager_prompt(blended_scores, portfolio)
 
+    # Raised defensively alongside the identical fix in news_sentiment.py's
+    # score_news_sentiment -- that function's max_tokens=300 was confirmed
+    # too low in practice (two real responses truncated mid-JSON), and this
+    # call shares the same model and the same invisible-ThinkingBlock-eats-
+    # the-budget risk (see _extract_response_text). This function proposes
+    # trades for potentially many symbols per cycle, so it gets more
+    # headroom than the single-symbol sentiment call.
     response = client.messages.create(
         model=model,
-        max_tokens=1000,
+        max_tokens=2048,
         system=_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
     )

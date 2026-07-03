@@ -102,6 +102,17 @@ class TestParseSentimentResponse:
         with pytest.raises(ValueError):
             parse_sentiment_response('{"score": 45, "reasoning": "unterminated string')
 
+    def test_truncated_response_error_mentions_truncation(self):
+        # Regression test for a real bug: two separate live responses
+        # (AMZN, NVDA) were cut off mid-JSON at exactly max_tokens, always
+        # right after the reasoning string closed but before the final
+        # "}". The error message should say so rather than just "not valid
+        # JSON", since the fix (raise max_tokens) is different from a
+        # genuine formatting bug.
+        truncated = '{"score": 20, "reasoning": "Some real analysis text that never got a closing brace."'
+        with pytest.raises(ValueError, match="truncated"):
+            parse_sentiment_response(truncated)
+
 
 # ============================================================
 # LLM-in-the-loop fixture test. Skipped unless ANTHROPIC_API_KEY is set.

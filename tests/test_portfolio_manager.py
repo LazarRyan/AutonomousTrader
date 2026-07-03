@@ -175,6 +175,14 @@ class TestParsePortfolioManagerResponse:
         assert len(proposals) == 1
         assert proposals[0].reasoning == "AWS's big bet is bullish."
 
+    def test_truncated_response_error_mentions_truncation(self):
+        # Same real bug class as news_sentiment.py's identical regression
+        # test: a response cut off mid-JSON (hit max_tokens) should say so,
+        # not just "not valid JSON".
+        truncated = '[{"symbol": "NVDA", "side": "buy", "quantity": 5, "reasoning": "some real analysis"'
+        with pytest.raises(ValueError, match="truncated"):
+            parse_portfolio_manager_response(truncated)
+
 
 # ============================================================
 # LLM-in-the-loop fixture test. Skipped unless ANTHROPIC_API_KEY is set.
