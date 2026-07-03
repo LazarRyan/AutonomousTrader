@@ -140,8 +140,9 @@ blended score just to have something to say.
 
 It is completely normal and often correct to propose NO trades in a given cycle.
 
-Respond with ONLY a single JSON array, no other text, in exactly this shape (empty array if no
-trades are warranted):
+Respond with ONLY a single JSON array, no other text before or after it, in exactly this shape
+(empty array if no trades are warranted). Put all explanation inside the "reasoning" field of each
+proposal -- do not add any commentary outside the JSON array itself:
 [{"symbol": "<TICKER>", "side": "buy" | "sell", "quantity": <positive number>, "reasoning": "<one or two sentence explanation>"}]
 """
 
@@ -189,8 +190,12 @@ def parse_portfolio_manager_response(response_text: str) -> list[CandidateTradeP
             text = text[4:]
         text = text.strip()
 
+    # Use raw_decode (rather than json.loads) so a model that appends stray
+    # commentary after the JSON array despite instructions not to (observed
+    # in practice) doesn't cause a hard parse failure -- we only need the
+    # first complete JSON value in the string, and ignore anything after it.
     try:
-        payload = json.loads(text)
+        payload, _ = json.JSONDecoder().raw_decode(text)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Portfolio manager response was not valid JSON: {response_text!r}") from exc
 
@@ -234,6 +239,18 @@ def parse_portfolio_manager_response(response_text: str) -> list[CandidateTradeP
 # ============================================================
 
 
+def _extract_response_text(response) -> str:
+    """Anthropic responses aren't guaranteed to have the text reply in
+    content[0] -- e.g. an extended-thinking block can precede it (observed
+    in practice with claude-sonnet-5, even without thinking explicitly
+    requested here). Find the first block with type == "text" instead of
+    assuming position."""
+    for block in response.content:
+        if getattr(block, "type", None) == "text":
+            return block.text
+    raise ValueError(f"No text block found in Anthropic response: {response.content!r}")
+
+
 def propose_candidate_trades(
     blended_scores: dict[str, float],
     portfolio: PortfolioContext,
@@ -253,5 +270,5 @@ def propose_candidate_trades(
         system=_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
     )
-    response_text = response.content[0].text
+    response_text = _extract_response_text(response)
     return parse_portfolio_manager_response(response_text)
