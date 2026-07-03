@@ -36,6 +36,7 @@ class Settings:
     alpaca_api_key: str
     alpaca_secret_key: str
     trading_mode: str  # "paper" (default/only supported for now) or "live"
+    anthropic_api_key: str | None = None  # required for the LLM-based signal/agent, not for Phase 0 core
 
     @property
     def is_live_mode(self) -> bool:
@@ -65,4 +66,5 @@ def load_settings() -> Settings:
         alpaca_api_key=required["ALPACA_API_KEY"],
         alpaca_secret_key=required["ALPACA_SECRET_KEY"],
         trading_mode=trading_mode,
+        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
     )
