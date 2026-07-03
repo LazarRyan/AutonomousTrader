@@ -110,6 +110,33 @@ def test_loss_limit_is_a_one_way_latch_within_period():
     assert state.daily_halted is True
 
 
+def test_default_config_leaves_a_real_approval_band_above_scorer_threshold():
+    # Regression test for a real bug found on a live dry run: this module's
+    # default max_position_pct used to be identical to risk/scorer.py's
+    # hard_override_position_pct (both 0.05), so ANY trade routed to the
+    # approval queue for exceeding 5% position size was guaranteed to be
+    # blocked here regardless of what a human approved -- three real trades
+    # (ABBV 16.57%, AEP 5.90%, ALGN 6.80%) were all approved via the CLI
+    # watcher, then all blocked immediately after. The default is now 0.15,
+    # specifically to leave a 5%-15% band where an approval can actually
+    # lead to execution.
+    state = SafetyState()
+    # 8% of portfolio -- above risk/scorer.py's 5% approval trigger, but
+    # within this module's default 15% hard cap. Uses the default config
+    # (no override) since that's what main.py and review_approvals.py
+    # actually construct in production.
+    decision = evaluate_trade(trade_value=8_000, total_portfolio_value=100_000, state=state)
+    assert decision.allowed is True
+
+
+def test_default_config_still_hard_blocks_far_oversized_trade():
+    state = SafetyState()
+    # 20% of portfolio -- above even the widened 15% default hard cap.
+    decision = evaluate_trade(trade_value=20_000, total_portfolio_value=100_000, state=state)
+    assert decision.allowed is False
+    assert any("max_position_size" in r for r in decision.reasons)
+
+
 def test_invalid_config_rejected():
     with pytest.raises(ValueError):
         SafetyConfig(max_position_pct=0.0)

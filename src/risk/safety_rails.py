@@ -14,6 +14,18 @@ below. A human approving a queued trade cannot override a safety rail --
 only an explicit config change (position size, loss limits) or an explicit
 kill-switch/halt reset can do that.
 
+IMPORTANT, found via a real dry run: risk/scorer.py's hard_override_position_pct
+(5%, triggers approval) and this module's max_position_pct used to BOTH
+default to 0.05. Since they were identical, ANY trade routed to the
+approval queue for exceeding 5% position size was mathematically
+guaranteed to be blocked here regardless of the human's decision -- there
+was no size range where an approval could ever actually result in
+execution (confirmed live: ABBV/AEP/ALGN were all approved via the CLI
+watcher, then all blocked here a moment later). max_position_pct is now
+0.15 specifically to leave a real 5%-15% band where a human approval can
+lead to execution; anything above 15% remains an absolute, non-negotiable
+block no matter what a human decides.
+
 Everything here is deterministic and unit-tested. No LLM involved.
 """
 
@@ -34,7 +46,12 @@ class HaltReason(str, Enum):
 @dataclass(frozen=True)
 class SafetyConfig:
     # Max size of any single trade, as a fraction of total portfolio value.
-    max_position_pct: float = 0.05
+    # This is the absolute, non-negotiable ceiling -- distinct from
+    # risk/scorer.py's hard_override_position_pct (0.05), which only decides
+    # whether a trade needs human approval. Deliberately set higher than
+    # that so there's a real 5%-15% band where an approval can actually
+    # result in execution (see module docstring for the real bug this fixes).
+    max_position_pct: float = 0.15
 
     # Daily realized+unrealized loss, as a fraction of portfolio value, that
     # triggers an automatic halt for the REST OF THE DAY. Resets automatically
