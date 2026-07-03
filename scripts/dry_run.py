@@ -5,6 +5,7 @@ end-to-end test of the whole pipeline, deliberately scoped to a small,
 explicit universe rather than the full S&P 500.
 
 Run with: python scripts/dry_run.py
+Or with a wider universe for one run: python scripts/dry_run.py --universe-size 30
 
 Why a small universe first: run_cycle()'s default (src.universe.load_sp500_universe())
 is ~500 symbols. Scanning all of them means ~500 sequential Alpaca momentum
@@ -13,9 +14,18 @@ fetches, ~500 SEC EDGAR insider lookups, ~500 Alpaca news fetches, and up to
 -- slow, and a real (if small) API cost, on a FIRST run before you've seen
 what a single cycle actually looks like end to end. DRY_RUN_UNIVERSE below
 mirrors src.main.DEFAULT_EXAMPLE_UNIVERSE (5 large, liquid, high-news-volume
-names) to keep the first run fast and cheap to eyeball. Widen it yourself
-(or just call run_cycle with universe=None / omit the override) once you've
-looked at one cycle's results and are comfortable with what it does.
+names) to keep the first run fast and cheap to eyeball.
+
+--universe-size N overrides DRY_RUN_UNIVERSE with the first N symbols from
+the real S&P 500 list (src.universe.load_sp500_universe()) instead -- every
+run against the 5-symbol default so far has produced a deliberate,
+correctly-logged zero-trade decision (moderately-signed blended scores,
+nothing strong enough to propose), so a wider one-off sample is a
+reasonable way to actually exercise the risk-scoring/execution/
+approval-queue code paths for real, without going anywhere near the full
+~500-symbol universe. Each additional symbol adds real Alpaca/SEC EDGAR
+calls plus one real (thinking-disabled, cheap) Anthropic sentiment call --
+use a moderate size (tens, not hundreds) for a one-off check.
 
 What it does, in order (identical pipeline to the real scheduled loop in
 src.main.run_cycle -- this script is not a simulation, it calls the exact
@@ -47,15 +57,33 @@ silently.
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 
 sys.path.insert(0, ".")  # allow `python scripts/dry_run.py` from repo root
 
 # Small, explicit universe for a first manual dry run -- NOT the real S&P
-# 500. Mirrors src.main.DEFAULT_EXAMPLE_UNIVERSE. Widen this list (or pass
-# your own) once you've reviewed one cycle's results.
+# 500. Mirrors src.main.DEFAULT_EXAMPLE_UNIVERSE. Override for one run with
+# --universe-size N (see module docstring), or edit this list directly for
+# a permanent change.
 DRY_RUN_UNIVERSE = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--universe-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Use the first N symbols from the real S&P 500 list instead of the "
+            "default 5-symbol DRY_RUN_UNIVERSE. Adds real API calls per symbol -- "
+            "use a moderate size (tens, not hundreds) for a one-off check."
+        ),
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
@@ -64,6 +92,8 @@ def main() -> None:
     from src.config import load_settings
     from src.db import get_client
     from src.main import run_cycle
+
+    args = _parse_args()
 
     settings = load_settings()
 
@@ -78,6 +108,19 @@ def main() -> None:
     if not sec_user_agent:
         raise RuntimeError("SEC_EDGAR_USER_AGENT must be set -- see .env.example")
 
+    if args.universe_size:
+        from src.universe import load_sp500_universe
+
+        full_universe = load_sp500_universe()
+        universe = full_universe[: args.universe_size]
+        if len(universe) < args.universe_size:
+            print(
+                f"Note: requested {args.universe_size} symbols but the S&P 500 "
+                f"list only has {len(full_universe)}; using all of them."
+            )
+    else:
+        universe = DRY_RUN_UNIVERSE
+
     supabase_client = get_client(settings)
     alpaca_trading_client = TradingClient(settings.alpaca_api_key, settings.alpaca_secret_key, paper=True)
 
@@ -88,7 +131,10 @@ def main() -> None:
     print(f"Paper account status : {account.status}")
     print(f"Paper account equity : ${float(account.equity):,.2f}")
     print(f"Paper account cash   : ${float(account.cash):,.2f}")
-    print(f"Universe (this run)  : {', '.join(DRY_RUN_UNIVERSE)}")
+    if len(universe) <= 10:
+        print(f"Universe (this run)  : {', '.join(universe)}")
+    else:
+        print(f"Universe (this run)  : {len(universe)} symbols ({universe[0]}...{universe[-1]})")
     print()
     print("This will make real network calls (Alpaca, SEC EDGAR, Anthropic),")
     print("write real rows to your Supabase project, and MAY place a real")
@@ -102,7 +148,7 @@ def main() -> None:
         return
 
     print("\nRunning cycle...\n")
-    run_cycle(supabase_client, alpaca_trading_client, settings, sec_user_agent, universe=DRY_RUN_UNIVERSE)
+    run_cycle(supabase_client, alpaca_trading_client, settings, sec_user_agent, universe=universe)
 
     print("\n" + "=" * 70)
     print("Cycle complete. Check results with:")
