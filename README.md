@@ -19,11 +19,29 @@ only supported mode. Live trading requires a distinct `TRADING_MODE=live`
 env var *and* a manual confirmation step in the execution agent that does
 not exist yet and will be built as its own deliberate second phase.
 
-## Status: end-to-end pipeline built and verified, not yet run live
+## Status: end-to-end pipeline built, verified, and run for real (paper)
+
+The full pipeline has completed a real, clean, end-to-end cycle against
+your actual Alpaca paper account and Supabase project: real momentum/
+insider/news signals for a small dry-run universe (`scripts/dry_run.py`),
+a real Anthropic call to the Portfolio Manager Agent, a deliberate
+zero-trade decision given the day's (moderately bearish, no held
+positions) blended scores, and a fully persisted `audit_log` row
+documenting that decision (`decision: 'no_trades_proposed'`) -- see
+`scripts/inspect_last_cycle.py` to check any cycle's outcome from your
+terminal. Getting here surfaced and fixed several real bugs that only
+show up against live data/APIs (Alpaca's SIP-feed subscription
+restriction, an alpaca-py response-shape mismatch, a Form 4 URL that
+actually serves rendered HTML instead of raw XML, an LLM invalid-JSON-
+escape edge case, and -- the big one -- Claude Sonnet 5's adaptive
+thinking being on by default and eating into the same token budget as
+visible output, which caused two rounds of real response truncation
+until thinking was explicitly disabled for these calls). Every one of
+these is now covered by a regression test built from the real failure.
 
 Every stage of the architecture (signals -> blending -> portfolio manager ->
 risk scoring -> execution/approval -> audit log) is implemented and covered
-by unit tests: 180 passing, plus 6 more gated behind a real
+by unit tests: 189 passing, plus 6 more gated behind a real
 `ANTHROPIC_API_KEY` -- all 6 have now been confirmed passing against the
 real Anthropic API (see "Credentials" below). What's built:
 
@@ -89,10 +107,18 @@ during setup -- still worth rotating all three at some point, since a chat
 log isn't a secure long-term home for live credentials, but nothing is
 blocking on it.
 
-**Not yet done before this can run for real:**
-- Nothing has been run against a live paper account yet -- the first real
-  `run_cycle()` against your actual paper account and the full S&P 500
-  universe is the natural next milestone.
+**Not yet done:**
+- `scripts/dry_run.py` has only been run against a small 5-symbol universe
+  (AAPL, MSFT, GOOGL, AMZN, NVDA) so far, not the full S&P 500 default
+  `run_cycle()` uses when scheduled for real -- worth trying a wider
+  universe (or several more small-universe runs on different days) before
+  fully trusting it unattended.
+- No trade has actually auto-executed or landed in `approval_queue` yet
+  (every real cycle so far has correctly decided "nothing to propose") --
+  the execution and approval-queue code paths are unit-tested but haven't
+  been exercised by a real end-to-end run yet.
+- Credential rotation (Supabase, Anthropic, Alpaca all passed through this
+  chat transcript during setup) still hasn't happened.
 - This sandboxed development environment's network is allowlisted in a way
   that blocks direct calls to Supabase, Anthropic, and Alpaca -- so all
   connectivity testing above happened on your machine, not this one.
