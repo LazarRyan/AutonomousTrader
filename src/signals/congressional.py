@@ -777,8 +777,26 @@ def fetch_senate_ptr_listing(user_agent: str, start_date: str, end_date: str) ->
     response would corrupt every response body, which would be a worse
     self-inflicted bug than the one this is fixing.)
 
+    Third real finding, from the SAME live debug session: the Accept/
+    Accept-Language headers alone didn't fix the 503 -- identical failure,
+    same endpoint, after adding them. Checked two more things directly
+    (not guessed): (1) urllib.request.Request does NOT auto-set
+    Content-Type on a POST body the way real browsers/jQuery do, confirmed
+    by inspecting a Request object's .headers directly -- real form POSTs
+    always send `Content-Type: application/x-www-form-urlencoded;
+    charset=UTF-8` explicitly. (2) `/search/report/data/` is a DataTables
+    server-side-processing endpoint -- the URL shape (`/data/` under a
+    `/report/` search path) is the standard signature of an AJAX-only
+    endpoint the site's own frontend JS calls via jQuery, which always
+    attaches `X-Requested-With: XMLHttpRequest` automatically; a real
+    browser's successful manual search (confirmed live) would have gone
+    through exactly that path. Both headers are now added explicitly on
+    the search POST specifically (the agree POST is a normal page-level
+    form submission, not an AJAX call, so it only gets the Content-Type
+    fix, not X-Requested-With).
+
     Still not fully validated end-to-end in this environment beyond these
-    two fixes -- the response row SHAPE (field names/order, whether it's a
+    fixes -- the response row SHAPE (field names/order, whether it's a
     dict or plain list) is still unconfirmed. Keep using
     scripts/debug_senate_listing.py to verify before wiring this into
     run_cycle().
@@ -786,6 +804,8 @@ def fetch_senate_ptr_listing(user_agent: str, start_date: str, end_date: str) ->
     import urllib.parse
     import urllib.request
     from http.cookiejar import CookieJar
+
+    FORM_CONTENT_TYPE = "application/x-www-form-urlencoded; charset=UTF-8"
 
     cookie_jar = CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
@@ -809,7 +829,9 @@ def fetch_senate_ptr_listing(user_agent: str, start_date: str, end_date: str) ->
         {"csrfmiddlewaretoken": csrf_token, "prohibition_agreement": "1"}
     ).encode()
     agree_request = urllib.request.Request(
-        home_url, data=agree_data, headers={"User-Agent": user_agent, "Referer": home_url}
+        home_url,
+        data=agree_data,
+        headers={"User-Agent": user_agent, "Referer": home_url, "Content-Type": FORM_CONTENT_TYPE},
     )
     _open_with_body_on_error(opener, agree_request)
 
@@ -823,7 +845,14 @@ def fetch_senate_ptr_listing(user_agent: str, start_date: str, end_date: str) ->
         }
     ).encode()
     search_request = urllib.request.Request(
-        search_url, data=search_data, headers={"User-Agent": user_agent, "Referer": home_url}
+        search_url,
+        data=search_data,
+        headers={
+            "User-Agent": user_agent,
+            "Referer": home_url,
+            "Content-Type": FORM_CONTENT_TYPE,
+            "X-Requested-With": "XMLHttpRequest",
+        },
     )
     import json
 
