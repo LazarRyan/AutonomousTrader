@@ -744,8 +744,20 @@ def _open_with_body_on_error(opener, request_or_url, timeout: int = 30) -> bytes
         return opener.open(request_or_url, timeout=timeout).read()
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
+        # Response HEADERS, not just the body -- three rounds of header
+        # fixes (Referer, Accept/Accept-Language, Content-Type/
+        # X-Requested-With) produced the exact same byte-identical 503
+        # page each time, which points away from anything HTTP-header-based
+        # and toward something further down the stack (a WAF keying off
+        # the TLS handshake fingerprint, or a plain IP-based rate limit --
+        # neither fixable by changing request headers). Response headers
+        # can directly name the responsible WAF/CDN (a Server header like
+        # "AkamaiGHost", a Retry-After suggesting real rate limiting, etc.)
+        # -- real evidence instead of a fourth guess.
+        headers_str = "\n".join(f"  {k}: {v}" for k, v in exc.headers.items())
         raise UnparseableFilingError(
-            f"HTTP {exc.code} from efdsearch.senate.gov: {body[:2000]!r}"
+            f"HTTP {exc.code} from efdsearch.senate.gov\nResponse headers:\n{headers_str}\n"
+            f"Body (first 2000 chars): {body[:2000]!r}"
         ) from exc
 
 
