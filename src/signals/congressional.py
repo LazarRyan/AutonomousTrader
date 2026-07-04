@@ -763,8 +763,22 @@ def fetch_senate_ptr_listing(user_agent: str, start_date: str, end_date: str) ->
     (independent of whether the CSRF token itself is correct) -- fixed by
     adding the same Referer header the search request already had.
 
-    Still not fully validated end-to-end in this environment beyond that
-    one fix -- the response row SHAPE (field names/order, whether it's a
+    Second real finding, from the SAME live debug session: after the
+    Referer fix, the request got past the point that used to 403, but then
+    hit a 503 "Site Under Maintenance" page on the search POST -- except a
+    normal browser hitting the same site at the same time got real data
+    back immediately (confirmed live). The site wasn't actually down; our
+    request just didn't look enough like a real browser request. A plain
+    urllib script sends only whatever headers it's told to -- real browsers
+    always send Accept and Accept-Language, and their absence is a common,
+    simple bot-detection signal for whatever's fronting this endpoint
+    (WAF/CDN). Added both below. (Accept-Encoding is deliberately NOT
+    added: claiming to accept gzip/br without actually decompressing the
+    response would corrupt every response body, which would be a worse
+    self-inflicted bug than the one this is fixing.)
+
+    Still not fully validated end-to-end in this environment beyond these
+    two fixes -- the response row SHAPE (field names/order, whether it's a
     dict or plain list) is still unconfirmed. Keep using
     scripts/debug_senate_listing.py to verify before wiring this into
     run_cycle().
@@ -775,7 +789,11 @@ def fetch_senate_ptr_listing(user_agent: str, start_date: str, end_date: str) ->
 
     cookie_jar = CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
-    opener.addheaders = [("User-Agent", user_agent)]
+    opener.addheaders = [
+        ("User-Agent", user_agent),
+        ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+        ("Accept-Language", "en-US,en;q=0.9"),
+    ]
 
     home_url = "https://efdsearch.senate.gov/search/home/"
     _open_with_body_on_error(opener, home_url)
