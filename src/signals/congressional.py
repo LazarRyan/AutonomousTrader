@@ -731,16 +731,43 @@ def fetch_recent_house_ptr_transactions(
     return ParseResult(transactions=all_transactions, flagged=all_flagged)
 
 
+def _open_with_body_on_error(opener, request_or_url, timeout: int = 30) -> bytes:
+    """urllib.request wrapper that includes the real response body in the
+    raised exception on an HTTP error, instead of just the bare status
+    code. Added after a live 403 from efdsearch.senate.gov gave no way to
+    tell a CSRF/Referer rejection apart from a bot-detection block without
+    a second round trip -- this surfaces that evidence on the first try.
+    """
+    import urllib.error
+
+    try:
+        return opener.open(request_or_url, timeout=timeout).read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise UnparseableFilingError(
+            f"HTTP {exc.code} from efdsearch.senate.gov: {body[:2000]!r}"
+        ) from exc
+
+
 def fetch_senate_ptr_listing(user_agent: str, start_date: str, end_date: str) -> list[dict]:
     """Query efdsearch.senate.gov for recent PTR filings between two dates
     (MM/DD/YYYY strings). Requires a two-step session flow: accept the
     site's terms to get a session cookie, then POST to the DataTables JSON
     search endpoint.
 
-    NOT validated against the live site in this environment -- the site's
-    form field names, CSRF token handling, and response shape are the parts
-    most likely to drift over time. Verify this against a live request
-    before relying on it, and expect to fix field names here occasionally.
+    Real bug found on first live use (via scripts/debug_senate_listing.py):
+    the terms-agreement POST got a 403 Forbidden that the search POST just
+    below it didn't -- the only difference was a missing Referer header.
+    efdsearch.senate.gov is a Django app, and Django enforces strict
+    Referer-checking on HTTPS POSTs by default as CSRF protection
+    (independent of whether the CSRF token itself is correct) -- fixed by
+    adding the same Referer header the search request already had.
+
+    Still not fully validated end-to-end in this environment beyond that
+    one fix -- the response row SHAPE (field names/order, whether it's a
+    dict or plain list) is still unconfirmed. Keep using
+    scripts/debug_senate_listing.py to verify before wiring this into
+    run_cycle().
     """
     import urllib.parse
     import urllib.request
@@ -751,7 +778,7 @@ def fetch_senate_ptr_listing(user_agent: str, start_date: str, end_date: str) ->
     opener.addheaders = [("User-Agent", user_agent)]
 
     home_url = "https://efdsearch.senate.gov/search/home/"
-    opener.open(home_url, timeout=30).read()
+    _open_with_body_on_error(opener, home_url)
 
     csrf_token = None
     for cookie in cookie_jar:
@@ -763,8 +790,10 @@ def fetch_senate_ptr_listing(user_agent: str, start_date: str, end_date: str) ->
     agree_data = urllib.parse.urlencode(
         {"csrfmiddlewaretoken": csrf_token, "prohibition_agreement": "1"}
     ).encode()
-    agree_request = urllib.request.Request(home_url, data=agree_data, headers={"User-Agent": user_agent})
-    opener.open(agree_request, timeout=30).read()
+    agree_request = urllib.request.Request(
+        home_url, data=agree_data, headers={"User-Agent": user_agent, "Referer": home_url}
+    )
+    _open_with_body_on_error(opener, agree_request)
 
     search_url = "https://efdsearch.senate.gov/search/report/data/"
     search_data = urllib.parse.urlencode(
@@ -780,7 +809,7 @@ def fetch_senate_ptr_listing(user_agent: str, start_date: str, end_date: str) ->
     )
     import json
 
-    response_body = opener.open(search_request, timeout=30).read()
+    response_body = _open_with_body_on_error(opener, search_request)
     payload = json.loads(response_body)
 
     return payload.get("data", [])
