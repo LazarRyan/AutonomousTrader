@@ -35,6 +35,16 @@ from datetime import date, timedelta
 
 sys.path.insert(0, ".")  # allow `python scripts/debug_senate_listing.py` from repo root
 
+# Load .env explicitly -- this script doesn't import src.config (which is
+# what normally triggers this as a side effect), so without this line
+# SEC_EDGAR_USER_AGENT would only be seen if it happened to already be
+# exported in the shell, not just present in .env. Same fix as the
+# ModuleNotFoundError/missing-sys.path bug found earlier in this same
+# script -- missed the pattern every other debug_*.py script already uses.
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from src.signals.congressional import fetch_senate_ptr_listing
 
 
