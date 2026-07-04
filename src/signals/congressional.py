@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import date
 
 
 class UnparseableFilingError(Exception):
@@ -556,6 +557,48 @@ def compute_congressional_signal(
     )
 
 
+def filter_filings_by_date(
+    filings: list[dict], since: date, until: date | None = None
+) -> list[dict]:
+    """Pure filter over fetch_house_disclosure_index()'s result rows (or
+    any dict list with a 'filingDate' key in MM/DD/YYYY string form) --
+    keeps only filings dated on/after `since` (and on/before `until` if
+    given, inclusive both ends). Used to narrow a full year's index down to
+    "recent" filings for per-cycle discovery, without needing a new network
+    call every time the lookback window changes.
+
+    A row with a missing or unparseable filingDate is skipped rather than
+    guessed at -- same discipline as the rest of this module -- since
+    fetch_house_disclosure_index's real index has occasionally included
+    rows for member types/edge cases outside the normal PTR shape.
+    """
+    until = until or date.max
+    kept = []
+    for filing in filings:
+        raw_date = filing.get("filingDate", "")
+        try:
+            month, day, year = raw_date.split("/")
+            filing_date = date(int(year), int(month), int(day))
+        except (ValueError, AttributeError):
+            continue
+        if since <= filing_date <= until:
+            kept.append(filing)
+    return kept
+
+
+def aggregate_transactions_by_ticker(
+    transactions: list[CongressionalTransaction],
+) -> dict[str, list[CongressionalTransaction]]:
+    """Bucket a flat list of parsed transactions -- typically gathered
+    across many filers' filings fetched in one cycle's discovery pull --
+    by ticker, ready for a per-symbol compute_congressional_signal() call.
+    Pure, no network."""
+    buckets: dict[str, list[CongressionalTransaction]] = {}
+    for txn in transactions:
+        buckets.setdefault(txn.ticker, []).append(txn)
+    return buckets
+
+
 # ============================================================
 # Network / binary wrappers -- not unit-tested here (require live network,
 # and for the Senate, a multi-step session flow). See module docstring's
@@ -633,6 +676,59 @@ def fetch_house_ptr_pdf(doc_id: str, year: int, user_agent: str) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": user_agent})
     with urllib.request.urlopen(request, timeout=30) as response:
         return response.read()
+
+
+def fetch_recent_house_ptr_transactions(
+    year: int, user_agent: str, since: date, until: date | None = None
+) -> ParseResult:
+    """Orchestrates House PTR discovery for one cycle: fetch the full
+    year's disclosure index, narrow it to `since`/`until` via
+    filter_filings_by_date, then fetch + extract + parse each matching
+    filing's PDF, merging every filing's transactions and flagged lines
+    into one ParseResult.
+
+    Thin glue -- not unit-tested here (real network calls throughout,
+    same as fetch_house_disclosure_index/fetch_house_ptr_pdf individually).
+    A single filing that fails to fetch or extract (network error,
+    scanned/image-only PDF) is skipped with a flagged entry rather than
+    aborting the whole cycle's discovery -- consistent with this module's
+    "one bad row/filing never discards everything else" discipline.
+
+    Callers spanning a year boundary (a lookback window starting in
+    December and running into January) need to call this once per
+    calendar year in range and merge the results themselves -- this
+    function only queries a single year's index.
+    """
+    index = fetch_house_disclosure_index(year, user_agent)
+    recent = filter_filings_by_date(index, since, until)
+
+    all_transactions: list[CongressionalTransaction] = []
+    all_flagged: list[FlaggedLine] = []
+
+    for filing in recent:
+        doc_id = filing.get("docId", "")
+        filer_name = f"{filing.get('first', '')} {filing.get('last', '')}".strip()
+        if not doc_id:
+            continue
+        try:
+            pdf_bytes = fetch_house_ptr_pdf(doc_id, year, user_agent)
+            text = extract_text_from_pdf(pdf_bytes)
+        except Exception as exc:  # noqa: BLE001 -- one bad filing must not abort discovery
+            all_flagged.append(
+                FlaggedLine(
+                    chamber="house",
+                    source_doc_id=doc_id,
+                    raw_line="",
+                    reason=f"could not fetch/extract filing PDF, skipping: {exc}",
+                )
+            )
+            continue
+
+        result = parse_house_ptr_text(text, source_doc_id=doc_id, filer_name=filer_name)
+        all_transactions.extend(result.transactions)
+        all_flagged.extend(result.flagged)
+
+    return ParseResult(transactions=all_transactions, flagged=all_flagged)
 
 
 def fetch_senate_ptr_listing(user_agent: str, start_date: str, end_date: str) -> list[dict]:

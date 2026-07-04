@@ -30,16 +30,20 @@ use a moderate size (tens, not hundreds) for a one-off check.
 What it does, in order (identical pipeline to the real scheduled loop in
 src.main.run_cycle -- this script is not a simulation, it calls the exact
 same function):
-  1. Checks the kill switch / daily / weekly halt state in Supabase --
-     bails immediately if trading is halted, same as the real loop would.
+  1. Checks the kill switch / daily / weekly halt state in Supabase, and
+     (now) the real Alpaca market calendar -- bails immediately if trading
+     is halted or today isn't a trading day, same as the real loop would.
   2. Fetches momentum / insider / news-sentiment signals for each symbol in
-     DRY_RUN_UNIVERSE (congressional is aggregated at the run_cycle level
-     across many filers' recent filings and will be neutral/absent for an
-     ad-hoc single-cycle run like this -- that aggregation isn't wired into
-     run_cycle yet, see the congressional signal's own module for why).
+     DRY_RUN_UNIVERSE. Congressional will be neutral/absent here: House PTR
+     discovery IS now wired into run_cycle, but only for its dynamic
+     default universe (real holdings + news/filing discovery) -- passing an
+     explicit universe, as this script always does, bypasses both news and
+     congressional discovery entirely and uses exactly the list you give
+     it. See run_cycle()'s docstring in src/main.py for the full design.
   3. Sends the blended per-symbol scores plus your REAL paper account's
-     current cash/holdings to the Portfolio Manager Agent (a real Anthropic
-     API call) and gets back zero or more candidate trades.
+     current cash/holdings (read directly from Alpaca's real positions, not
+     the Supabase `holdings` table) to the Portfolio Manager Agent (a real
+     Anthropic API call) and gets back zero or more candidate trades.
   4. For each candidate: scores its risk, writes a candidate_trades row
      (ALWAYS -- whether or not anything ends up executing), and either:
        - auto-executes it as a REAL PAPER order via Alpaca (paper money,

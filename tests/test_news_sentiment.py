@@ -20,8 +20,52 @@ import pytest
 from src.signals.news_sentiment import (
     ParsedSentiment,
     build_sentiment_prompt,
+    bucket_headlines_by_symbol,
     parse_sentiment_response,
 )
+
+
+class _FakeArticle:
+    """Stand-in for an alpaca-py News object -- bucket_headlines_by_symbol
+    only touches .symbols and .headline, so tests don't need the real SDK
+    model just to exercise this pure grouping logic."""
+
+    def __init__(self, symbols: list[str], headline: str):
+        self.symbols = symbols
+        self.headline = headline
+
+
+class TestBucketHeadlinesBySymbol:
+    def test_groups_headline_under_each_mentioned_symbol(self):
+        articles = [_FakeArticle(["AAPL"], "Apple beats earnings")]
+        result = bucket_headlines_by_symbol(articles)
+        assert result == {"AAPL": ["Apple beats earnings"]}
+
+    def test_one_article_mentioning_multiple_symbols_goes_to_each(self):
+        articles = [_FakeArticle(["AAPL", "MSFT"], "Tech stocks rally")]
+        result = bucket_headlines_by_symbol(articles)
+        assert result == {"AAPL": ["Tech stocks rally"], "MSFT": ["Tech stocks rally"]}
+
+    def test_multiple_articles_for_the_same_symbol_accumulate(self):
+        articles = [
+            _FakeArticle(["AAPL"], "Headline one"),
+            _FakeArticle(["AAPL"], "Headline two"),
+        ]
+        result = bucket_headlines_by_symbol(articles)
+        assert result == {"AAPL": ["Headline one", "Headline two"]}
+
+    def test_symbols_normalized_to_uppercase_and_stripped(self):
+        articles = [_FakeArticle([" aapl "], "Some headline")]
+        result = bucket_headlines_by_symbol(articles)
+        assert result == {"AAPL": ["Some headline"]}
+
+    def test_article_with_no_symbols_contributes_nothing(self):
+        articles = [_FakeArticle([], "General market commentary")]
+        result = bucket_headlines_by_symbol(articles)
+        assert result == {}
+
+    def test_empty_article_list_returns_empty_dict(self):
+        assert bucket_headlines_by_symbol([]) == {}
 
 
 class TestBuildSentimentPrompt:

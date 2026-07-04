@@ -1,9 +1,13 @@
+from datetime import date
+
 import pytest
 
 from src.signals.congressional import (
     CongressionalSignalConfig,
     CongressionalTransaction,
+    aggregate_transactions_by_ticker,
     compute_congressional_signal,
+    filter_filings_by_date,
     parse_house_ptr_text,
     parse_ptr_text,
     parse_senate_ptr_text,
@@ -611,6 +615,72 @@ class TestParsePtrTextDispatch:
     def test_unknown_chamber_raises(self):
         with pytest.raises(ValueError):
             parse_ptr_text("anything", "house_of_lords", "doc3", "Someone")
+
+
+class TestFilterFilingsByDate:
+    def test_keeps_filings_on_or_after_since(self):
+        filings = [{"docId": "1", "filingDate": "01/15/2026"}, {"docId": "2", "filingDate": "01/20/2026"}]
+        result = filter_filings_by_date(filings, since=date(2026, 1, 18))
+        assert [f["docId"] for f in result] == ["2"]
+
+    def test_since_boundary_is_inclusive(self):
+        filings = [{"docId": "1", "filingDate": "01/18/2026"}]
+        result = filter_filings_by_date(filings, since=date(2026, 1, 18))
+        assert len(result) == 1
+
+    def test_until_excludes_later_filings(self):
+        filings = [{"docId": "1", "filingDate": "01/15/2026"}, {"docId": "2", "filingDate": "01/25/2026"}]
+        result = filter_filings_by_date(filings, since=date(2026, 1, 1), until=date(2026, 1, 20))
+        assert [f["docId"] for f in result] == ["1"]
+
+    def test_until_boundary_is_inclusive(self):
+        filings = [{"docId": "1", "filingDate": "01/20/2026"}]
+        result = filter_filings_by_date(filings, since=date(2026, 1, 1), until=date(2026, 1, 20))
+        assert len(result) == 1
+
+    def test_missing_filing_date_is_skipped_not_raised(self):
+        filings = [{"docId": "1"}, {"docId": "2", "filingDate": "01/20/2026"}]
+        result = filter_filings_by_date(filings, since=date(2026, 1, 1))
+        assert [f["docId"] for f in result] == ["2"]
+
+    def test_unparseable_filing_date_is_skipped_not_raised(self):
+        filings = [{"docId": "1", "filingDate": "not-a-date"}, {"docId": "2", "filingDate": "01/20/2026"}]
+        result = filter_filings_by_date(filings, since=date(2026, 1, 1))
+        assert [f["docId"] for f in result] == ["2"]
+
+    def test_no_until_means_unbounded_upper_end(self):
+        filings = [{"docId": "1", "filingDate": "12/31/2099"}]
+        result = filter_filings_by_date(filings, since=date(2026, 1, 1))
+        assert len(result) == 1
+
+    def test_empty_input_returns_empty_list(self):
+        assert filter_filings_by_date([], since=date(2026, 1, 1)) == []
+
+
+class TestAggregateTransactionsByTicker:
+    def _txn(self, ticker: str) -> CongressionalTransaction:
+        return CongressionalTransaction(
+            chamber="house",
+            source_doc_id="doc1",
+            filer_name="SMITH JOHN",
+            owner="SELF",
+            ticker=ticker,
+            asset_name="Some Asset",
+            transaction_type="purchase",
+            transaction_date="2026-01-15",
+            amount_low=1001.0,
+            amount_high=15000.0,
+            raw_line="raw",
+        )
+
+    def test_buckets_by_ticker(self):
+        txns = [self._txn("AAPL"), self._txn("AAPL"), self._txn("MSFT")]
+        result = aggregate_transactions_by_ticker(txns)
+        assert len(result["AAPL"]) == 2
+        assert len(result["MSFT"]) == 1
+
+    def test_empty_input_returns_empty_dict(self):
+        assert aggregate_transactions_by_ticker([]) == {}
 
 
 class TestComputeCongressionalSignal:

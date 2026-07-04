@@ -190,6 +190,51 @@ def fetch_recent_news(symbol: str, api_key: str, secret_key: str, limit: int = 2
     return [article.headline for article in response.data["news"]]
 
 
+def fetch_market_news_window(api_key: str, secret_key: str, start, end, limit: int = 200) -> list:
+    """Broad, symbol-LESS news pull for a time window -- alpaca-py's
+    NewsRequest.symbols is optional (confirmed against its actual source),
+    so omitting it returns recent market-wide news rather than one ticker's.
+    Returns raw alpaca-py News objects (each carries its own `.symbols`
+    list of every ticker it mentions or relates to).
+
+    Used for two things at once, by src.main.run_cycle: (1) universe
+    discovery -- see bucket_headlines_by_symbol below, feeding
+    discovery.rank_discovered_symbols -- and (2) as the headline source for
+    score_news_sentiment() on any symbol this pull already covers, so a
+    discovered symbol doesn't need a second, separate per-symbol
+    fetch_recent_news call for the same time window.
+
+    Thin network wrapper, not unit-tested here -- see module docstring.
+    """
+    from alpaca.data.historical.news import NewsClient
+    from alpaca.data.requests import NewsRequest
+
+    client = NewsClient(api_key, secret_key)
+    request = NewsRequest(start=start, end=end, limit=limit)
+    response = client.get_news(request)
+    return response.data["news"]
+
+
+def bucket_headlines_by_symbol(articles: list) -> dict[str, list[str]]:
+    """Group already-fetched news articles by every ticker they mention.
+
+    No network call -- pure grouping logic, fully unit-tested with simple
+    fixture objects (anything with `.symbols: list[str]` and
+    `.headline: str` works; real alpaca-py News objects satisfy this, but
+    tests use plain stand-ins to avoid needing the SDK's real model just to
+    exercise this function). A single article mentioning multiple symbols
+    contributes its headline to each of them.
+    """
+    buckets: dict[str, list[str]] = {}
+    for article in articles:
+        for raw_symbol in article.symbols:
+            symbol = raw_symbol.strip().upper()
+            if not symbol:
+                continue
+            buckets.setdefault(symbol, []).append(article.headline)
+    return buckets
+
+
 def _extract_response_text(response) -> str:
     """Anthropic responses aren't guaranteed to have the text reply in
     content[0] -- e.g. an extended-thinking block can precede it (observed

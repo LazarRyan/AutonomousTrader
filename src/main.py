@@ -1,16 +1,20 @@
 """
-Entry point -- the scheduled run loop (build plan: every 15-30 min during
-market hours) that ties everything else together:
+Entry point -- the scheduled run loop, now scheduled 3x/day (9:40am/2:30pm/
+3:50pm ET via launchd -- see scripts/launchd/) rather than continuously,
+that ties everything else together:
 
   1. Load config + safety_state from Supabase.
   2. If kill switch engaged or daily/weekly halted -> log and exit early.
-  3. Generate signals (momentum, insider, congressional, news sentiment)
-     for every symbol in the trading universe.
-  4. Blend signals per symbol (agents.portfolio_manager.compute_blended_signal_score).
-  5. Portfolio Manager Agent proposes candidate trades.
-  6. Risk scorer scores each candidate (risk.scorer.score_trade).
-  7. Below threshold -> Execution Agent (paper only). At/above -> approval_queue.
-  8. Everything, taken or not, gets an audit_log row.
+  3. If today isn't a trading day, or the market's already closed for the
+     day (early close), log and exit early.
+  4. Build this cycle's trading universe (see UNIVERSE NOTE below).
+  5. Generate signals (momentum, insider, congressional, news sentiment)
+     for every symbol in that universe.
+  6. Blend signals per symbol (agents.portfolio_manager.compute_blended_signal_score).
+  7. Portfolio Manager Agent proposes candidate trades.
+  8. Risk scorer scores each candidate (risk.scorer.score_trade).
+  9. Below threshold -> Execution Agent (paper only). At/above -> approval_queue.
+  10. Everything, taken or not, gets an audit_log row.
 
 Same split as the rest of the project:
 
@@ -26,17 +30,25 @@ Same split as the rest of the project:
          pattern as agents/execution.py and scripts/review_approvals.py.
          This is the piece that decides "does this trade auto-fire or wait
          for a human," so it gets full coverage.
+       - The universe-discovery MATH (src.discovery.rank_discovered_symbols,
+         compute_lookback_start) is pure and fully tested there; only the
+         network calls that feed it are untested glue, same split as ever.
 
   2. Thin, not-unit-tested glue: gather_signal_snapshot() (calls all four
      signal-source fetchers for one symbol, tolerating individual source
      failures), run_cycle() (the actual scheduled entry point), and main().
 
-TRADING UNIVERSE NOTE: build plan section 4a specifies S&P 500 constituents.
-run_cycle() defaults to the real list via src.universe.load_sp500_universe(),
-backed by data/sp500_constituents.csv (see that module's docstring for how
-it's kept fresh). DEFAULT_EXAMPLE_UNIVERSE below is only for passing an
-explicit small override into run_cycle() during manual local dry runs --
-it is not used unless you pass it in yourself.
+UNIVERSE NOTE (redesigned -- see run_cycle()'s own docstring for the full
+reasoning): run_cycle() used to default to scanning the full static S&P 500
+list (src.universe.load_sp500_universe(), backed by
+data/sp500_constituents.csv) every single cycle. Now that it's scheduled
+3x/day instead of continuously, the default is instead built fresh each run
+from real current Alpaca positions plus whatever tickers actually showed up
+in recent news or congressional PTR filings -- a much smaller, much more
+relevant set. DEFAULT_EXAMPLE_UNIVERSE below is unrelated to either of
+these -- it's only for passing an explicit small override into run_cycle()
+during manual local dry runs (scripts/dry_run.py), which bypasses dynamic
+discovery entirely and uses exactly the list you give it.
 """
 
 from __future__ import annotations
@@ -169,7 +181,14 @@ class MarketContext:
     liquidity_penalty: float
 
 
-def gather_signal_snapshot(symbol: str, settings, sec_user_agent: str, cik_map: dict[str, str] | None = None):
+def gather_signal_snapshot(
+    symbol: str,
+    settings,
+    sec_user_agent: str,
+    cik_map: dict[str, str] | None = None,
+    prefetched_headlines: dict[str, list[str]] | None = None,
+    congressional_transactions_by_ticker: dict[str, list] | None = None,
+):
     """Call all four signal sources for one symbol, tolerating individual
     source failures (a down/rate-limited source shouldn't take out the
     whole symbol -- compute_blended_signal_score already handles partial
@@ -181,6 +200,17 @@ def gather_signal_snapshot(symbol: str, settings, sec_user_agent: str, cik_map: 
     every symbol, which would mean re-downloading and re-parsing the same
     multi-thousand-entry ticker->CIK file 500 times per cycle for no
     reason. Falls back to a live SEC fetch only if no map is supplied.
+
+    prefetched_headlines and congressional_transactions_by_ticker are the
+    per-cycle discovery results built once by run_cycle() (a single broad
+    news pull and a single recent-filings pull, respectively -- see
+    run_cycle()'s docstring). When this symbol is present in either dict,
+    its data is used directly instead of a second, redundant network call;
+    a symbol NOT covered by discovery (e.g. a held position with zero
+    recent news or filings) falls back to the old per-symbol
+    fetch_recent_news call, and simply gets no congressional score (None,
+    same as before congressional discovery existed) if it has no
+    aggregated transactions.
     """
     from src.agents.portfolio_manager import SignalSnapshot
     from src.signals import congressional, insider_edgar, momentum, news_sentiment
@@ -202,17 +232,28 @@ def gather_signal_snapshot(symbol: str, settings, sec_user_agent: str, cik_map: 
     except Exception as exc:  # noqa: BLE001
         print(f"[{symbol}] insider signal failed, continuing without it: {exc}")
 
-    # Congressional signal requires matching parsed PTR transactions across
-    # recent House/Senate filings to this symbol's ticker -- that
-    # aggregation (across many filers' filings, not just one) is
-    # orchestrated at the run_cycle level, not per-symbol, since it's far
-    # more efficient to fetch the recent filing indexes once per cycle and
-    # then bucket transactions by ticker. See run_cycle().
+    # Congressional signal: uses this cycle's already-fetched, already-
+    # aggregated House PTR transactions (built once by run_cycle() via
+    # congressional.fetch_recent_house_ptr_transactions +
+    # aggregate_transactions_by_ticker) -- no per-symbol network call here
+    # at all. A symbol with no recent filed transactions correctly gets no
+    # score (None), same as before this signal was wired in. Senate
+    # discovery is not yet part of this dict -- see
+    # scripts/debug_senate_listing.py for why.
     congressional_score = None
+    try:
+        transactions = (congressional_transactions_by_ticker or {}).get(symbol.upper())
+        if transactions:
+            congressional_score = congressional.compute_congressional_signal(transactions).score
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{symbol}] congressional signal failed, continuing without it: {exc}")
 
     news_score = None
     try:
-        headlines = news_sentiment.fetch_recent_news(symbol, settings.alpaca_api_key, settings.alpaca_secret_key)
+        if prefetched_headlines is not None and symbol.upper() in prefetched_headlines:
+            headlines = prefetched_headlines[symbol.upper()]
+        else:
+            headlines = news_sentiment.fetch_recent_news(symbol, settings.alpaca_api_key, settings.alpaca_secret_key)
         if headlines:
             news_score = news_sentiment.score_news_sentiment(symbol, headlines, settings.anthropic_api_key).score
     except Exception as exc:  # noqa: BLE001
@@ -227,30 +268,83 @@ def gather_signal_snapshot(symbol: str, settings, sec_user_agent: str, cik_map: 
     )
 
 
+def _previous_trading_session_close(alpaca_trading_client, before):
+    """The real close time of the most recent trading session strictly
+    before `before` (a date) -- used as the discovery lookback anchor for
+    the first scheduled cycle of a trading day, so a Monday morning run
+    correctly spans the whole weekend and a post-holiday run spans the
+    holiday, without hardcoding a fixed hour count anywhere. Thin glue, not
+    unit-tested (real Alpaca calendar call) -- the pure logic that USES this
+    value lives in src.discovery.compute_lookback_start.
+    """
+    from datetime import timedelta
+
+    from alpaca.trading.requests import GetCalendarRequest
+
+    lookback_start = before - timedelta(days=14)  # generous enough to span any real holiday cluster
+    calendar = alpaca_trading_client.get_calendar(GetCalendarRequest(start=lookback_start, end=before - timedelta(days=1)))
+    if not calendar:
+        raise RuntimeError(f"no trading sessions found in the 14 days before {before} -- calendar data problem")
+    return calendar[-1].close
+
+
 def run_cycle(
     supabase_client,
     alpaca_trading_client,
     settings,
     sec_user_agent: str,
     universe: list[str] | None = None,
+    discovery_cap: int = 50,
 ) -> None:
     """The actual scheduled entry point. Not unit-tested -- real network
     calls throughout. The pieces that matter for correctness
     (is_trading_halted, process_candidate_trade) are tested in isolation;
     this function is glue.
+
+    UNIVERSE, redesigned for the 3x/day launchd schedule (9:40am/2:30pm/
+    3:50pm ET -- see scripts/launchd/): when `universe` isn't passed in
+    explicitly, it's no longer the full static S&P 500 list scanned blindly
+    every cycle. It's built fresh each run from three sources, unioned
+    together:
+      1. Real current Alpaca positions (via get_all_positions() -- NOT the
+         Supabase `holdings` table, which record_executed_trade() doesn't
+         currently keep in sync; reading directly from Alpaca means this is
+         always accurate regardless of that gap).
+      2. Tickers mentioned in a single broad (symbol-less) Alpaca news pull
+         since the last scheduled cycle, ranked by mention count and capped
+         at `discovery_cap`, filtered to the known S&P 500 list (screens
+         out OTC/junk tickers the rest of the pipeline -- insider EDGAR's
+         CIK map in particular -- isn't built to handle).
+      3. Tickers mentioned in House PTR filings filed since the last cycle,
+         same ranking/cap/filter. (Senate discovery isn't wired in yet --
+         see scripts/debug_senate_listing.py for why.)
+
+    An explicit `universe` argument (e.g. scripts/dry_run.py's small manual
+    lists) bypasses all of this and is used as-is, same as before -- the
+    dynamic default only applies to the real scheduled entry point.
+
+    This also adds a market-day check: a scheduled (launchd) run firing on
+    a weekend or market holiday, or after an early close, now skips cleanly
+    with an audit_log row instead of wasting real API calls against a
+    closed market.
     """
+    from alpaca.trading.requests import GetCalendarRequest
+
     from src.agents.execution import make_live_dependencies
     from src.agents.portfolio_manager import (
         BlendConfig,
+        HoldingSnapshot,
         PortfolioContext,
         compute_blended_signal_score,
         propose_candidate_trades,
     )
     from src.db import write_audit_log
+    from src.discovery import compute_lookback_start, rank_discovered_symbols
+    from src.signals import congressional, news_sentiment
     from src.universe import load_sp500_cik_map, load_sp500_universe
 
-    universe = universe or load_sp500_universe()
     cik_map = load_sp500_cik_map()
+    sp500_universe_set = set(load_sp500_universe())
 
     def log_audit(event_type, decision, reasoning, symbol=None, candidate_trade_id=None, metadata=None):
         write_audit_log(
@@ -278,22 +372,120 @@ def run_cycle(
         print(f"Cycle skipped: {reason}")
         return
 
+    # Market-day / calendar check. Calendar.open/close come back as NAIVE
+    # datetimes from alpaca-py (confirmed against its actual source: its
+    # Calendar.__init__ builds them with datetime.strptime and no %z), while
+    # Clock.timestamp is documented as already being in Eastern time --
+    # stripping its tzinfo (not converting) gives the matching Eastern
+    # wall-clock value, so the two are safely comparable.
+    now_clock = alpaca_trading_client.get_clock()
+    now_eastern_naive = now_clock.timestamp.replace(tzinfo=None)
+    today = now_clock.timestamp.date()
+
+    todays_calendar = alpaca_trading_client.get_calendar(GetCalendarRequest(start=today, end=today))
+    if not todays_calendar:
+        log_audit(event_type="cycle", decision="cycle_skipped", reasoning=f"{today} is not a trading day (weekend/holiday)")
+        print(f"Cycle skipped: {today} is not a trading day")
+        return
+
+    todays_close = todays_calendar[0].close
+    if now_eastern_naive > todays_close:
+        log_audit(
+            event_type="cycle",
+            decision="cycle_skipped",
+            reasoning=(
+                f"market already closed for the day (closed {todays_close}, now {now_eastern_naive}) -- "
+                f"likely an early-close day, skipping this scheduled slot rather than running against a closed market"
+            ),
+        )
+        print("Cycle skipped: market already closed today")
+        return
+
     account = alpaca_trading_client.get_account()
     total_portfolio_value = float(account.equity)
     cash_available = float(account.cash)
 
-    holdings_rows = supabase_client.table("holdings").select("*").execute().data
-    from src.agents.portfolio_manager import HoldingSnapshot
-
+    # Real Alpaca positions -- see run_cycle()'s docstring for why this
+    # replaces the (unsynced) Supabase `holdings` table as the source of
+    # truth for both the portfolio context sent to the portfolio manager
+    # AND the universe's held-position component below.
+    positions = alpaca_trading_client.get_all_positions()
     holdings = [
-        HoldingSnapshot(symbol=row["symbol"], quantity=row["quantity"], avg_entry_price=row["avg_entry_price"])
-        for row in holdings_rows
+        HoldingSnapshot(symbol=p.symbol, quantity=float(p.qty), avg_entry_price=float(p.avg_entry_price))
+        for p in positions
     ]
+    held_symbols = {h.symbol.upper() for h in holdings}
+
+    news_headlines_by_symbol: dict[str, list[str]] = {}
+    congressional_transactions_by_ticker: dict[str, list] = {}
+
+    if universe is None:
+        try:
+            previous_close = _previous_trading_session_close(alpaca_trading_client, today)
+        except Exception as exc:  # noqa: BLE001 -- discovery is best-effort; held positions still get scanned
+            print(f"could not determine previous trading session close, using a 24h lookback instead: {exc}")
+            from datetime import timedelta
+
+            previous_close = now_eastern_naive - timedelta(hours=24)
+
+        lookback_start = compute_lookback_start(now_eastern_naive, previous_close)
+
+        news_discovered: list[str] = []
+        try:
+            news_articles = news_sentiment.fetch_market_news_window(
+                settings.alpaca_api_key, settings.alpaca_secret_key, start=lookback_start, end=now_clock.timestamp
+            )
+            news_headlines_by_symbol = news_sentiment.bucket_headlines_by_symbol(news_articles)
+            news_discovered = rank_discovered_symbols(
+                [article.symbols for article in news_articles], cap=discovery_cap, valid_universe=sp500_universe_set
+            )
+        except Exception as exc:  # noqa: BLE001 -- one discovery source must not take out the whole cycle
+            print(f"broad news discovery pull failed, continuing without it: {exc}")
+
+        congressional_discovered: list[str] = []
+        try:
+            house_transactions: list = []
+            # fetch_recent_house_ptr_transactions only queries one calendar
+            # year's disclosure index -- span the year boundary explicitly
+            # if the lookback window crosses it (e.g. an early-January run
+            # looking back into December).
+            for year in {lookback_start.date().year, today.year}:
+                result = congressional.fetch_recent_house_ptr_transactions(
+                    year=year, user_agent=sec_user_agent, since=lookback_start.date(), until=today
+                )
+                house_transactions.extend(result.transactions)
+
+            congressional_transactions_by_ticker = congressional.aggregate_transactions_by_ticker(house_transactions)
+            congressional_discovered = rank_discovered_symbols(
+                [[txn.ticker] for txn in house_transactions], cap=discovery_cap, valid_universe=sp500_universe_set
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"congressional discovery pull failed, continuing without it: {exc}")
+
+        universe = sorted(held_symbols | set(news_discovered) | set(congressional_discovered))
+        log_audit(
+            event_type="cycle",
+            decision="universe_discovered",
+            reasoning=(
+                f"dynamic universe for this cycle: {len(held_symbols)} held position(s), "
+                f"{len(news_discovered)} news-discovered, {len(congressional_discovered)} "
+                f"congressional-discovered ({len(universe)} unique symbol(s) total), "
+                f"lookback since {lookback_start}"
+            ),
+            metadata={"universe": universe},
+        )
 
     blend_config = BlendConfig()
     blended_scores: dict[str, float] = {}
     for symbol in universe:
-        snapshot = gather_signal_snapshot(symbol, settings, sec_user_agent, cik_map=cik_map)
+        snapshot = gather_signal_snapshot(
+            symbol,
+            settings,
+            sec_user_agent,
+            cik_map=cik_map,
+            prefetched_headlines=news_headlines_by_symbol,
+            congressional_transactions_by_ticker=congressional_transactions_by_ticker,
+        )
         try:
             blended_scores[symbol] = compute_blended_signal_score(snapshot, blend_config)
         except ValueError:
