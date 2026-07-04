@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ryan.autonomous-trader.run-cycle</string>
+
+    <!-- Fires every day at these three times. Weekends, holidays, and
+         early closes are handled by main.py's own market-day check (added
+         specifically for this schedule), not here, so this doesn't need a
+         Weekday key duplicating that logic. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>9</integer>
+            <key>Minute</key>
+            <integer>40</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>14</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>15</integer>
+            <key>Minute</key>
+            <integer>50</integer>
+        </dict>
+    </array>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/ryanlazar/Documents/AutonomousTrader/scripts/launchd/run_cycle.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/ryanlazar/Documents/AutonomousTrader</string>
+
+    <!-- Don't fire immediately when loaded or at login, only at the three
+         scheduled times above. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- No attached terminal when this fires unattended, so these capture
+         exactly what a manual `python -m src.main` run would print. Check
+         these after the fact, especially the first few real firings. -->
+    <key>StandardOutPath</key>
+    <string>/Users/ryanlazar/Library/Logs/autonomous-trader/run-cycle.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ryanlazar/Library/Logs/autonomous-trader/run-cycle.err.log</string>
+</dict>
+</plist>
