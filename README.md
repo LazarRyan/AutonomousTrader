@@ -81,11 +81,47 @@ case):
   above 15% remains an absolute block regardless of approval.
 
 Every one of these is covered by a regression test built from the real
-failure -- current count: **200 tests passing**, plus 6 more gated behind
+failure -- current count: **229 tests passing**, plus 6 more gated behind
 a real `ANTHROPIC_API_KEY` (all 6 have been confirmed passing against the
 real Anthropic API; they only "fail" in a sandboxed environment that can't
 reach api.anthropic.com over the network, which is expected there and not
 a real problem).
+
+## Scheduling: 3x/day instead of continuous, with a redesigned universe
+
+`run_cycle()` is now meant to run on a fixed schedule (9:40am / 2:30pm /
+3:50pm ET, via `launchd` -- see `scripts/launchd/README.md` for setup)
+rather than continuously, and its default trading universe changed to
+match: instead of blindly scanning the full static S&P 500 (~500 symbols)
+every cycle, it's now built fresh each run from real current Alpaca
+positions (`get_all_positions()`, not the unsynced `holdings` table --
+see below) plus whatever tickers actually showed up in a broad news pull
+or in House PTR filings since the last cycle, ranked by mention count and
+capped at 50. `src/discovery.py` holds the pure, tested ranking/lookback-
+window logic; the network glue that feeds it lives next to each source's
+other wrappers in `news_sentiment.py` and `congressional.py`.
+
+This also finally wires the congressional signal into `run_cycle()` --
+previously always `None`. House discovery is fully wired (using the
+already-validated `fetch_house_disclosure_index`); Senate discovery is
+deliberately NOT wired in yet, since `fetch_senate_ptr_listing`'s real row
+shape has never been validated against the live site -- run
+`scripts/debug_senate_listing.py` once to get real evidence before wiring
+it in, rather than guessing at field names.
+
+A market-day check (via Alpaca's real `get_clock`/`get_calendar`) was
+added at the top of `run_cycle()` so a scheduled run firing on a weekend,
+holiday, or after an early close skips cleanly with an `audit_log` row
+instead of running against a closed market. An explicit `universe`
+argument (as `scripts/dry_run.py` always passes) bypasses all of this and
+uses exactly the list given, same as before.
+
+Apache Airflow was considered and deliberately not used for the
+scheduling itself -- there's no multi-task orchestration need here (one
+script, no internal dependencies), and Airflow would still need
+`launchd`/`brew services` underneath to keep its own scheduler alive, so
+it would add a database and a second system to maintain without removing
+the actual OS-level "keep this running" requirement.
 
 ## Live dashboard
 
@@ -139,12 +175,19 @@ needed for this. Reload it any time to get fresh data.
   queue-for-approval decision) are fully tested; the signal-gathering loop
   itself is thin glue over the tested pieces, same as every other
   network-touching module in this project.
+- `src/discovery.py` -- pure, fully-tested per-cycle universe discovery:
+  `rank_discovered_symbols()` (mention-frequency ranking + cap + universe
+  filter) and `compute_lookback_start()` (schedule-aware lookback window,
+  see "Scheduling" above).
+- `scripts/launchd/` -- the `launchd` setup for the 3x/day schedule: a
+  `.plist`, a wrapper script, and setup/troubleshooting instructions.
 - Diagnostic scripts: `scripts/dry_run.py` (manual one-shot cycle run, with
   `--universe-size N` for a wider one-off sample), `scripts/
   inspect_last_cycle.py` (check `audit_log`/`candidate_trades`/
-  `approval_queue` from the terminal), `scripts/debug_form4.py` and
-  `scripts/debug_sentiment_truncation.py` (one-off diagnostics built for
-  the two real bugs described above, kept around in case either recurs).
+  `approval_queue` from the terminal), `scripts/debug_form4.py`,
+  `scripts/debug_sentiment_truncation.py`, and
+  `scripts/debug_senate_listing.py` (one-off diagnostics, kept around in
+  case any of the underlying issues recur).
 
 **Credentials:** `.env` has real Supabase, Anthropic, and Alpaca (paper)
 API-key values in place, and all three have been verified working from
@@ -152,12 +195,23 @@ your own machine.
 
 ## Not yet done
 
-- **Holdings aren't synced.** `record_executed_trade()` writes to
-  `executed_trades` but nothing currently updates the `holdings` table, so
-  it still shows 0 rows despite 3 real executed trades. This means the
-  next cycle's portfolio context (what the portfolio manager is told you
-  currently own) won't reflect real positions yet -- worth fixing before
-  relying on sell-side proposals or position-aware sizing.
+- **The Supabase `holdings` table still isn't synced** -- `record_executed_trade()`
+  writes to `executed_trades` but nothing updates `holdings`, so it still
+  shows 0 rows despite real executed trades. This no longer affects
+  trading decisions (`run_cycle()` now reads real positions directly from
+  Alpaca's `get_all_positions()` instead -- see "Scheduling" above), but
+  the live dashboard artifact still reads the Supabase table directly, so
+  its "Holdings" section will keep showing stale/empty data until this is
+  fixed or the dashboard is pointed at Alpaca too.
+- **Senate PTR discovery isn't wired in.** House filings are; Senate isn't,
+  because `fetch_senate_ptr_listing`'s real row shape has never been
+  validated against the live site. Run `scripts/debug_senate_listing.py`
+  once to get real evidence, then wire in a proper field mapping.
+- **launchd needs your Python interpreter path filled in** before it'll
+  work -- `scripts/launchd/run_cycle.sh` has a placeholder
+  (`REPLACE_WITH_OUTPUT_OF_WHICH_PYTHON`) that needs the real output of
+  `which python` from your conda environment. See
+  `scripts/launchd/README.md` for the full one-time setup.
 - **Credential rotation** (Supabase, Anthropic, Alpaca all passed through
   this chat transcript during initial setup) still hasn't happened.
 - This sandboxed development environment's network is allowlisted in a way
