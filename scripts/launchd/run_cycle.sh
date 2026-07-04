@@ -19,11 +19,7 @@ set -euo pipefail
 
 PROJECT_DIR="/Users/ryanlazar/Documents/AutonomousTrader"
 
-# TODO: fill this in with the output of `which python` from the terminal
-# where your tests/dry runs already work (the one that showed conda's
-# Python 3.13.5 Anaconda build). Do not leave this as a bare "python" --
-# launchd's minimal environment won't resolve it the way your shell does.
-PYTHON_BIN="REPLACE_WITH_OUTPUT_OF_WHICH_PYTHON"
+PYTHON_BIN="/opt/anaconda3/bin/python"
 
 cd "$PROJECT_DIR"
 echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') : starting scheduled run_cycle ==="
