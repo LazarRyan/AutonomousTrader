@@ -652,11 +652,32 @@ def run_cycle(
         )
 
 
+def _parse_main_args() -> "argparse.Namespace":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        default=False,
+        help=(
+            "Show account status/mode and ask for an explicit y/n confirmation before "
+            "running the cycle. OFF by default so launchd's unattended scheduled runs "
+            "(no stdin/TTY attached -- see scripts/launchd/run_cycle.sh) never hang "
+            "waiting on input. Pass this flag only for manual/interactive runs, e.g. "
+            "the first live test of a new pipeline change: `python -m src.main --confirm`."
+        ),
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     from alpaca.trading.client import TradingClient
 
     from src.config import load_settings
     from src.db import get_client
+
+    args = _parse_main_args()
 
     settings = load_settings()
     if not settings.anthropic_api_key:
@@ -672,6 +693,27 @@ def main() -> None:
     sec_user_agent = os.getenv("SEC_EDGAR_USER_AGENT")
     if not sec_user_agent:
         raise RuntimeError("SEC_EDGAR_USER_AGENT must be set -- see .env.example")
+
+    if args.confirm:
+        account = alpaca_trading_client.get_account()
+        mode = "LIVE (real money)" if settings.is_live_mode else "paper (fake money)"
+        print("=" * 70)
+        print("AUTONOMOUS-TRADER -- MANUAL RUN (--confirm)")
+        print("=" * 70)
+        print(f"Trading mode  : {mode}")
+        print(f"Account status: {account.status}")
+        print(f"Equity        : ${float(account.equity):,.2f}")
+        print(f"Cash          : ${float(account.cash):,.2f}")
+        print()
+        print("This will run the full scheduled cycle right now: dynamic universe")
+        print("discovery (holdings + news + congressional), real signal/API calls,")
+        print("and MAY place a real order if the portfolio manager proposes a trade.")
+        print()
+        confirm = input("Proceed? [y/N] ").strip().lower()
+        if confirm != "y":
+            print("Aborted -- nothing was run.")
+            return
+        print("\nRunning cycle...\n")
 
     run_cycle(supabase_client, alpaca_trading_client, settings, sec_user_agent)
 
