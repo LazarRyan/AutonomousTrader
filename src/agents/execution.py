@@ -58,6 +58,12 @@ class ExecutionRequest:
     quantity: float
     trade_value: float  # dollar value of this trade, for the safety-rail size check
     total_portfolio_value: float
+    # Cash available for buys, for the no-margin safety rail (see
+    # risk/safety_rails.py -- added after the account's cash went negative
+    # in practice). None skips that rail; both real callers (run_cycle and
+    # the approval watcher) always supply a value, the default exists only
+    # so the field is non-breaking for older call sites.
+    cash_available: float | None = None
 
     def __post_init__(self) -> None:
         if self.side not in ("buy", "sell"):
@@ -110,7 +116,12 @@ def execute_trade(
     # --- Gate 2: safety rails. Independent of and stricter than any
     # upstream risk-score approval -- see risk/safety_rails.py.
     safety_decision = evaluate_trade(
-        request.trade_value, request.total_portfolio_value, safety_state, safety_config
+        request.trade_value,
+        request.total_portfolio_value,
+        safety_state,
+        safety_config,
+        side=request.side,
+        cash_available=request.cash_available,
     )
     if not safety_decision.allowed:
         log_audit(

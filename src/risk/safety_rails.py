@@ -41,6 +41,7 @@ class HaltReason(str, Enum):
     DAILY_LOSS_LIMIT = "daily_loss_limit"
     WEEKLY_LOSS_LIMIT = "weekly_loss_limit"
     MAX_POSITION_SIZE = "max_position_size"
+    INSUFFICIENT_CASH = "insufficient_cash"
 
 
 @dataclass(frozen=True)
@@ -131,6 +132,8 @@ def evaluate_trade(
     total_portfolio_value: float,
     state: SafetyState,
     config: SafetyConfig | None = None,
+    side: str = "buy",
+    cash_available: float | None = None,
 ) -> SafetyDecision:
     """The single choke point every order must pass through before firing.
 
@@ -140,6 +143,21 @@ def evaluate_trade(
       2. Daily loss halt
       3. Weekly loss halt
       4. Max position size
+      5. No-margin check: a BUY whose value exceeds cash_available is
+         blocked. Added 2026-07-07 after the account's cash went NEGATIVE
+         in practice: Alpaca accounts (paper included) are margin accounts
+         by default, and Alpaca accepts orders as long as *buying power*
+         (~2x equity) covers them -- nothing upstream ever checked cash, so
+         consecutive auto-executed buys quietly slid the account into
+         borrowing. This rail makes "never trade on margin" an explicit,
+         non-negotiable policy rather than a hope.
+
+         cash_available=None skips the check (deliberately, for callers
+         with no cash figure to offer -- but both real execution paths,
+         run_cycle and the approval watcher, always pass one). Sells are
+         never cash-blocked: they raise cash. A negative cash_available
+         blocks every buy, which is exactly the intended behavior while
+         the account is still working off an existing margin debit.
 
     Returns allowed=True only if ALL checks pass.
     """
@@ -173,6 +191,12 @@ def evaluate_trade(
         reasons.append(
             f"{HaltReason.MAX_POSITION_SIZE.value}: trade is {position_pct:.2%} of portfolio, "
             f"exceeds max position size {config.max_position_pct:.2%}"
+        )
+
+    if side == "buy" and cash_available is not None and trade_value > cash_available:
+        reasons.append(
+            f"{HaltReason.INSUFFICIENT_CASH.value}: buy of ${trade_value:,.2f} exceeds available "
+            f"cash ${cash_available:,.2f} -- trading on margin is not permitted"
         )
 
     return SafetyDecision(allowed=(len(reasons) == 0), reasons=reasons)

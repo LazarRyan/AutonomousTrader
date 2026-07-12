@@ -89,7 +89,7 @@ a real problem).
 
 ## Scheduling: 3x/day instead of continuous, with a redesigned universe
 
-`run_cycle()` is now meant to run on a fixed schedule (9:40am / 2:30pm /
+`run_cycle()` is now meant to run on a fixed schedule (9:20am / 1:30pm /
 3:50pm ET, via `launchd` -- see `scripts/launchd/README.md` for setup)
 rather than continuously, and its default trading universe changed to
 match: instead of blindly scanning the full static S&P 500 (~500 symbols)

@@ -15,11 +15,11 @@
             <key>Hour</key>
             <integer>9</integer>
             <key>Minute</key>
-            <integer>40</integer>
+            <integer>20</integer>
         </dict>
         <dict>
             <key>Hour</key>
-            <integer>14</integer>
+            <integer>13</integer>
             <key>Minute</key>
             <integer>30</integer>
         </dict>
@@ -34,11 +34,11 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/ryanlazar/Documents/AutonomousTrader/scripts/launchd/run_cycle.sh</string>
+        <string>/Users/ryanlazar/dev/AutonomousTrader/scripts/launchd/run_cycle.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/ryanlazar/Documents/AutonomousTrader</string>
+    <string>/Users/ryanlazar/dev/AutonomousTrader</string>
 
     <!-- Don't fire immediately when loaded or at login, only at the three
          scheduled times above. -->

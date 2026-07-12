@@ -1,5 +1,5 @@
 """
-Entry point -- the scheduled run loop, now scheduled 3x/day (9:40am/2:30pm/
+Entry point -- the scheduled run loop, now scheduled 3x/day (9:20am/1:30pm/
 3:50pm ET via launchd -- see scripts/launchd/) rather than continuously,
 that ties everything else together:
 
@@ -15,6 +15,11 @@ that ties everything else together:
   8. Risk scorer scores each candidate (risk.scorer.score_trade).
   9. Below threshold -> Execution Agent (paper only). At/above -> approval_queue.
   10. Everything, taken or not, gets an audit_log row.
+  11. Best-effort macOS notifications (src/notify.py): one the moment a
+      trade lands in approval_queue (so it doesn't just wait silently until
+      someone happens to check the dashboard), and one at the end of the
+      cycle summarizing what happened (executed/queued/blocked/no trades).
+      Never affects any decision above -- see notify.py's own docstring.
 
 Same split as the rest of the project:
 
@@ -65,6 +70,7 @@ LogAuditFn = Callable[..., None]
 ExecuteTradeFn = Callable[[ExecutionRequest], ExecutionResult]
 InsertCandidateTradeFn = Callable[[CandidateTradeProposal, float, RiskScoreResult], str]  # -> candidate_trade_id
 InsertApprovalQueueItemFn = Callable[[str, RiskScoreResult], None]
+NotifyApprovalNeededFn = Callable[[CandidateTradeProposal, RiskScoreResult], None]
 
 # NOT the real S&P 500 -- a small, clearly-labeled example universe for
 # local dry runs only. See module docstring.
@@ -104,11 +110,26 @@ def process_candidate_trade(
     execute_trade_fn: ExecuteTradeFn,
     log_audit: LogAuditFn,
     risk_config: RiskScorerConfig | None = None,
+    notify_approval_needed: NotifyApprovalNeededFn | None = None,
+    cash_available: float | None = None,
 ) -> str:
     """Dispatch decision for one proposed trade: score it, persist the
     candidate_trades row (always -- taken or not, per the audit-log
     discipline), and either route to auto-execution or the approval queue.
     Fully unit-tested via injected fakes -- see tests/test_main.py.
+
+    cash_available feeds the no-margin safety rail at execution time (see
+    risk/safety_rails.py) -- run_cycle passes its running remaining-cash
+    figure so a sequence of buys within one cycle can't collectively
+    overspend what any single one of them would have been allowed to.
+
+    notify_approval_needed, if given, is called with (proposal, risk_result)
+    the moment a trade is routed to the approval queue -- this is what lets
+    a human find out a trade is waiting on them without having to poll the
+    dashboard or run scripts/review_approvals.py speculatively. Optional and
+    defaults to None (no-op) so this stays a pure dispatch decision by
+    default, same DI pattern as every other dependency here; run_cycle()
+    wires in a real macOS-notification closure (see src/notify.py).
     """
     trade_value = proposal.quantity * proposed_price
 
@@ -137,6 +158,8 @@ def process_candidate_trade(
             symbol=proposal.symbol,
             candidate_trade_id=candidate_trade_id,
         )
+        if notify_approval_needed is not None:
+            notify_approval_needed(proposal, risk_result)
         return "queued_for_approval"
 
     log_audit(
@@ -154,6 +177,7 @@ def process_candidate_trade(
         quantity=proposal.quantity,
         trade_value=trade_value,
         total_portfolio_value=total_portfolio_value,
+        cash_available=cash_available,
     )
     result = execute_trade_fn(request)
     return result.status
@@ -188,6 +212,7 @@ def gather_signal_snapshot(
     cik_map: dict[str, str] | None = None,
     prefetched_headlines: dict[str, list[str]] | None = None,
     congressional_transactions_by_ticker: dict[str, list] | None = None,
+    supabase_client=None,
 ):
     """Call all four signal sources for one symbol, tolerating individual
     source failures (a down/rate-limited source shouldn't take out the
@@ -211,14 +236,36 @@ def gather_signal_snapshot(
     fetch_recent_news call, and simply gets no congressional score (None,
     same as before congressional discovery existed) if it has no
     aggregated transactions.
+
+    supabase_client, if given, gets one src.db.write_signal() row per source
+    that actually produced a result this cycle (best-effort -- a write
+    failure is caught and logged inside write_signal itself, never raised
+    here). This is what makes each source's full reasoning/component
+    breakdown -- not just the single number that ends up in
+    SignalSnapshot -- queryable after the fact; before this, every one of
+    these *Result objects was built, its .reasoning read into nothing, and
+    then discarded the moment gather_signal_snapshot returned. Optional and
+    defaults to None so tests / callers that don't care about persistence
+    (or don't have a client handy) aren't forced to supply one.
     """
+    import dataclasses
+
     from src.agents.portfolio_manager import SignalSnapshot
     from src.signals import congressional, insider_edgar, momentum, news_sentiment
+
+    def _persist(signal_type: str, score: float | None, result) -> None:
+        if supabase_client is None or result is None:
+            return
+        from src.db import write_signal
+
+        write_signal(supabase_client, symbol, signal_type, score, dataclasses.asdict(result))
 
     momentum_score = None
     try:
         closes = momentum.fetch_daily_closes(symbol, settings.alpaca_api_key, settings.alpaca_secret_key)
-        momentum_score = momentum.compute_momentum_score(symbol, closes).momentum_score
+        momentum_result = momentum.compute_momentum_score(symbol, closes)
+        momentum_score = momentum_result.momentum_score
+        _persist("momentum", momentum_score, momentum_result)
     except Exception as exc:  # noqa: BLE001 -- one bad source must not take out the whole symbol
         print(f"[{symbol}] momentum signal failed, continuing without it: {exc}")
 
@@ -228,7 +275,9 @@ def gather_signal_snapshot(
         if not cik:
             cik = insider_edgar.fetch_ticker_cik_map(sec_user_agent).get(symbol.upper())
         if cik:
-            insider_score = insider_edgar.fetch_insider_signal(symbol, cik, sec_user_agent).score
+            insider_result = insider_edgar.fetch_insider_signal(symbol, cik, sec_user_agent)
+            insider_score = insider_result.score
+            _persist("insider", insider_score, insider_result)
     except Exception as exc:  # noqa: BLE001
         print(f"[{symbol}] insider signal failed, continuing without it: {exc}")
 
@@ -244,7 +293,9 @@ def gather_signal_snapshot(
     try:
         transactions = (congressional_transactions_by_ticker or {}).get(symbol.upper())
         if transactions:
-            congressional_score = congressional.compute_congressional_signal(transactions).score
+            congressional_result = congressional.compute_congressional_signal(transactions)
+            congressional_score = congressional_result.score
+            _persist("congressional", congressional_score, congressional_result)
     except Exception as exc:  # noqa: BLE001
         print(f"[{symbol}] congressional signal failed, continuing without it: {exc}")
 
@@ -255,7 +306,9 @@ def gather_signal_snapshot(
         else:
             headlines = news_sentiment.fetch_recent_news(symbol, settings.alpaca_api_key, settings.alpaca_secret_key)
         if headlines:
-            news_score = news_sentiment.score_news_sentiment(symbol, headlines, settings.anthropic_api_key).score
+            news_result = news_sentiment.score_news_sentiment(symbol, headlines, settings.anthropic_api_key)
+            news_score = news_result.score
+            _persist("news_sentiment", news_score, news_result)
     except Exception as exc:  # noqa: BLE001
         print(f"[{symbol}] news sentiment signal failed, continuing without it: {exc}")
 
@@ -301,7 +354,7 @@ def run_cycle(
     (is_trading_halted, process_candidate_trade) are tested in isolation;
     this function is glue.
 
-    UNIVERSE, redesigned for the 3x/day launchd schedule (9:40am/2:30pm/
+    UNIVERSE, redesigned for the 3x/day launchd schedule (9:20am/1:30pm/
     3:50pm ET -- see scripts/launchd/): when `universe` isn't passed in
     explicitly, it's no longer the full static S&P 500 list scanned blindly
     every cycle. It's built fresh each run from three sources, unioned
@@ -485,6 +538,7 @@ def run_cycle(
             cik_map=cik_map,
             prefetched_headlines=news_headlines_by_symbol,
             congressional_transactions_by_ticker=congressional_transactions_by_ticker,
+            supabase_client=supabase_client,
         )
         try:
             blended_scores[symbol] = compute_blended_signal_score(snapshot, blend_config)
@@ -523,6 +577,12 @@ def run_cycle(
             metadata={"blended_scores": blended_scores},
         )
         print("Cycle complete: portfolio manager proposed no trades this cycle")
+        from src.notify import send_macos_notification
+
+        send_macos_notification(
+            title="Autonomous Trader: cycle complete",
+            message=f"Scanned {len(blended_scores)} symbol(s) -- no trades proposed this cycle.",
+        )
         return
 
     place_order, _log_audit_unused, record_executed_trade, update_candidate_trade_status = make_live_dependencies(
@@ -574,6 +634,17 @@ def run_cycle(
             }
         ).execute()
 
+    def notify_approval_needed(proposal: CandidateTradeProposal, risk_result: RiskScoreResult) -> None:
+        from src.notify import send_macos_notification
+
+        send_macos_notification(
+            title="Autonomous Trader: trade needs approval",
+            message=(
+                f"{proposal.symbol} {proposal.side.upper()} x{proposal.quantity:g} -- "
+                f"{risk_result.reasoning}. {proposal.reasoning}"
+            ),
+        )
+
     # Benchmark volatility (SPY by default) is computed once per cycle and
     # reused for every candidate -- risk/scorer.py only cares about the
     # asset/benchmark RATIO, and recomputing the same benchmark 500 times
@@ -605,6 +676,21 @@ def run_cycle(
     from alpaca.data.requests import StockLatestQuoteRequest
 
     market_data_client = StockHistoricalDataClient(settings.alpaca_api_key, settings.alpaca_secret_key)
+
+    # One status string per proposal that actually made it to
+    # process_candidate_trade (a proposal skipped below for missing
+    # price/volatility data never reaches that call, so isn't in here --
+    # tallied separately as "skipped" in the end-of-cycle notification).
+    cycle_outcomes: list[str] = []
+
+    # Running cash figure for the no-margin rail: starts from the account's
+    # real cash at cycle start, decremented by each executed buy so several
+    # buys in one cycle can't collectively spend past zero (the account
+    # snapshot alone wouldn't catch that -- orders here are placed seconds
+    # apart, faster than fills settle into account.cash). Deliberately NOT
+    # credited back by sells: sell proceeds aren't reliably reflected until
+    # they settle, so within a cycle this stays conservative.
+    remaining_cash = cash_available
 
     for proposal in proposals:
         try:
@@ -638,7 +724,7 @@ def run_cycle(
             )
             continue
 
-        process_candidate_trade(
+        outcome = process_candidate_trade(
             proposal,
             proposed_price=proposed_price,
             total_portfolio_value=total_portfolio_value,
@@ -649,7 +735,53 @@ def run_cycle(
             insert_approval_queue_item=insert_approval_queue_item,
             execute_trade_fn=execute_trade_fn,
             log_audit=log_audit,
+            notify_approval_needed=notify_approval_needed,
+            cash_available=remaining_cash,
         )
+        cycle_outcomes.append(outcome)
+        if outcome == "executed" and proposal.side == "buy":
+            remaining_cash -= proposal.quantity * proposed_price
+
+    _notify_cycle_summary(len(proposals), cycle_outcomes)
+
+
+def _notify_cycle_summary(num_proposals: int, outcomes: list[str]) -> None:
+    """Best-effort 'the scheduled run finished, here's what happened' macOS
+    notification -- fired once at the end of a cycle that reached the
+    propose/execute stage. Deliberately NOT called from any of the earlier
+    'nothing to do' skip branches in run_cycle() (kill switch/loss halt,
+    non-trading day, market already closed, no signal data, benchmark
+    volatility unavailable) -- those would otherwise fire 3x/day on every
+    routine weekend and holiday with nothing new to say. The queued-for-
+    approval notification (see notify_approval_needed above) already covers
+    the one skip-adjacent outcome that's genuinely time-sensitive.
+    """
+    from collections import Counter
+
+    from src.notify import send_macos_notification
+
+    counts = Counter(outcomes)
+    skipped = num_proposals - len(outcomes)  # missing price/volatility data, see loop above
+
+    parts = []
+    if counts["executed"]:
+        parts.append(f"{counts['executed']} executed")
+    if counts["queued_for_approval"]:
+        parts.append(f"{counts['queued_for_approval']} queued for approval")
+    if counts["blocked"]:
+        parts.append(f"{counts['blocked']} blocked")
+    if counts["execution_failed"]:
+        parts.append(f"{counts['execution_failed']} failed")
+    if counts["refused_live_mode"]:
+        parts.append(f"{counts['refused_live_mode']} refused (live mode)")
+    if skipped:
+        parts.append(f"{skipped} skipped (no price/volatility data)")
+
+    summary = ", ".join(parts) if parts else "no outcomes recorded"
+    send_macos_notification(
+        title="Autonomous Trader: cycle complete",
+        message=f"{num_proposals} trade(s) proposed -- {summary}.",
+    )
 
 
 def _parse_main_args() -> "argparse.Namespace":

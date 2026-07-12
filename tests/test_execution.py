@@ -186,3 +186,36 @@ class TestOrderPlacement:
         assert blocked_result.status != failed_result.status
         assert blocked_result.status == "blocked"
         assert failed_result.status == "execution_failed"
+
+
+class TestNoMarginRailThroughExecuteTrade:
+    """The insufficient_cash rail (risk/safety_rails.py) wired through the
+    Execution Agent via ExecutionRequest.cash_available -- the same
+    cannot-be-bypassed path as every other rail: blocked BEFORE
+    place_order, audit row written, candidate status set to 'blocked'."""
+
+    def test_buy_exceeding_cash_is_blocked_before_any_order(self):
+        request = make_request(side="buy", trade_value=2_000.0, cash_available=1_500.0)
+        result, deps = run(request)
+        assert result.status == "blocked"
+        assert "insufficient_cash" in result.reasoning
+        assert deps.place_order_calls == []
+        assert deps.update_status_calls == [("ct-1", "blocked")]
+
+    def test_buy_within_cash_executes(self):
+        request = make_request(side="buy", trade_value=2_000.0, cash_available=2_500.0)
+        result, deps = run(request)
+        assert result.status == "executed"
+        assert len(deps.place_order_calls) == 1
+
+    def test_sell_executes_even_with_negative_cash(self):
+        request = make_request(side="sell", trade_value=2_000.0, cash_available=-500.0)
+        result, deps = run(request)
+        assert result.status == "executed"
+
+    def test_cash_available_omitted_skips_the_rail(self):
+        # Default None -- backwards compatible; both real callers always
+        # supply a value (see run_cycle and the approval watcher).
+        request = make_request(side="buy", trade_value=2_000.0)
+        result, deps = run(request)
+        assert result.status == "executed"

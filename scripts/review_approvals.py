@@ -119,10 +119,16 @@ def handle_approval_decision(
     update_approval_status: UpdateApprovalStatusFn,
     update_candidate_trade_status: UpdateCandidateStatusFn,
     log_audit: LogAuditFn,
+    cash_available: float | None = None,
 ) -> str:
     """What happens after a y/n is given. Returns the final outcome status
     string. Fully unit-tested via fake dependencies -- see
     tests/test_review_approvals.py.
+
+    cash_available (the account's real cash, fetched fresh alongside
+    total_portfolio_value by the polling loop) feeds the no-margin safety
+    rail -- an approved BUY that exceeds available cash is still blocked at
+    execution, same non-negotiable discipline as the position-size cap.
     """
     if not approved:
         update_approval_status(item.approval_id, "rejected", RESOLVED_BY_CLI)
@@ -170,6 +176,7 @@ def handle_approval_decision(
         quantity=item.quantity,
         trade_value=trade_value,
         total_portfolio_value=total_portfolio_value,
+        cash_available=cash_available,
     )
     # Note: execute_trade_fn still runs the trade through the safety rails
     # (kill switch, loss halts, max position size) -- a human's "yes" here
@@ -274,7 +281,12 @@ def poll_approval_queue(
                 print(format_approval_prompt(item))
                 approved = prompt_yes_no("Approve this trade? [y/n]: ")
 
-                total_portfolio_value = get_portfolio_value(alpaca_trading_client)
+                # Fetched fresh per decision (not cached across the loop):
+                # equity for the position-size rail, cash for the no-margin
+                # rail -- both may have moved since the queue item was created.
+                account = alpaca_trading_client.get_account()
+                total_portfolio_value = float(account.equity)
+                cash_available = float(account.cash)
 
                 safety_row = supabase_client.table("safety_state").select("*").limit(1).execute().data[0]
                 safety_state = SafetyState(
@@ -307,6 +319,7 @@ def poll_approval_queue(
                     ),
                     update_candidate_trade_status=update_candidate_trade_status,
                     log_audit=log_audit,
+                    cash_available=cash_available,
                 )
                 print(f"-> {outcome}\n")
 

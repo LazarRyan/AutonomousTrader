@@ -1,10 +1,22 @@
-# launchd schedule: 9:40am / 2:30pm / 3:50pm ET
+# launchd schedule: 9:20am / 1:30pm / 3:50pm ET
 
 Runs `python -m src.main` (the real scheduled entry point -- places real
 paper trades, same as everything else in this project) three times a day
 instead of continuously. Weekends, holidays, and early closes are handled
 by `run_cycle()`'s own market-day check (added specifically for this),
 not by launchd -- see `src/main.py`'s docstring.
+
+The 9:20am slot fires 10 minutes before the 9:30am open on purpose, so
+signals/proposals are ready and any resulting order is already queued with
+Alpaca in time for the opening cross. Two things worth knowing about that
+slot specifically: (1) a regular DAY market order (no `extended_hours` flag
+set -- see `place_alpaca_order` in `src/agents/execution.py`) submitted
+before the open is accepted and queued for the opening auction rather than
+rejected, so this works as intended; (2) the price used for risk-scoring at
+9:20am comes from Alpaca's IEX quote feed, and IEX itself doesn't trade
+pre-market -- so that "proposed_price" may just be the prior close's
+quote, not genuine live pre-market price discovery, and the actual fill at
+the open can differ from it.
 
 ## One-time setup
 
@@ -24,7 +36,7 @@ not by launchd -- see `src/main.py`'s docstring.
 2. **Make the wrapper script executable:**
 
    ```bash
-   chmod +x /Users/ryanlazar/Documents/AutonomousTrader/scripts/launchd/run_cycle.sh
+   chmod +x /Users/ryanlazar/dev/AutonomousTrader/scripts/launchd/run_cycle.sh
    ```
 
 3. **Create the log directory** (launchd won't create it for you):
@@ -36,7 +48,7 @@ not by launchd -- see `src/main.py`'s docstring.
 4. **Copy the plist into LaunchAgents:**
 
    ```bash
-   cp /Users/ryanlazar/Documents/AutonomousTrader/scripts/launchd/com.ryan.autonomous-trader.run-cycle.plist \
+   cp /Users/ryanlazar/dev/AutonomousTrader/scripts/launchd/com.ryan.autonomous-trader.run-cycle.plist \
       ~/Library/LaunchAgents/
    ```
 
@@ -49,6 +61,33 @@ not by launchd -- see `src/main.py`'s docstring.
    (On older macOS versions where `bootstrap` isn't available, use
    `launchctl load ~/Library/LaunchAgents/com.ryan.autonomous-trader.run-cycle.plist`
    instead.)
+
+## Do NOT keep this project in ~/Documents (or Desktop/Downloads)
+
+Real failure found in practice (2026-07-06, the first attempted scheduled
+runs): with the project in `~/Documents`, every launchd firing died with
+
+```
+/bin/bash: .../run_cycle.sh: Operation not permitted
+```
+
+before the script ran at all -- macOS's TCC privacy protection covers
+Documents/Desktop/Downloads, and the grant your Terminal has doesn't
+extend to a bash process spawned by launchd in the background. One run got
+far enough for python to start and then failed with
+`No module named 'src'` -- same cause (python couldn't read the project
+contents inside the protected folder), not a real import problem.
+
+Fix used: move the project to an unprotected path (`~/dev/AutonomousTrader`),
+update the paths in `run_cycle.sh` and the `.plist`, re-copy the plist, and
+reload. The alternative -- granting `/bin/bash` Full Disk Access -- works
+but extends that grant to every launchd bash script on the machine, so it
+was deliberately not used.
+
+`diagnose.sh` in this directory checks for this and everything else in
+this README (installed-plist drift, load state, missing log dir,
+interpreter path, terminal-notifier) -- run it first whenever scheduled
+runs aren't happening.
 
 ## Verifying it's loaded
 
@@ -78,12 +117,32 @@ scheduled time arrives).
 
 ## Making changes later
 
-If you edit `run_cycle.sh` or the `.plist` after it's already loaded,
-reload it so launchd picks up the change:
+If you edit `run_cycle.sh`, reload it the same way (it's invoked by path,
+so no copy step needed for that one):
 
 ```bash
 launchctl bootout gui/$(id -u)/com.ryan.autonomous-trader.run-cycle
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ryan.autonomous-trader.run-cycle.plist
+```
+
+If you edit the `.plist` itself (e.g. changing the schedule times), you
+MUST re-copy it into `~/Library/LaunchAgents/` first -- `bootstrap` loads
+from that copy, not from the repo file directly, so skipping this step
+silently reloads the OLD schedule with no error or warning:
+
+```bash
+cp /Users/ryanlazar/dev/AutonomousTrader/scripts/launchd/com.ryan.autonomous-trader.run-cycle.plist \
+   ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.ryan.autonomous-trader.run-cycle
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ryan.autonomous-trader.run-cycle.plist
+```
+
+Verify the copy actually took (compares the live copy against the repo's):
+
+```bash
+diff ~/Library/LaunchAgents/com.ryan.autonomous-trader.run-cycle.plist \
+     /Users/ryanlazar/dev/AutonomousTrader/scripts/launchd/com.ryan.autonomous-trader.run-cycle.plist \
+  && echo "in sync" || echo "MISMATCH -- re-copy and reload"
 ```
 
 ## Turning it off
@@ -101,3 +160,40 @@ same "safe failure mode" `scripts/review_approvals.py`'s own docstring
 already describes) until you run `python scripts/review_approvals.py`
 yourself, whenever you next check in. The live dashboard artifact is the
 easiest way to see if anything's waiting without needing a terminal open.
+
+You'll also get a native macOS notification the moment it's queued (see
+`src/notify.py`), and a second notification at the end of every cycle
+summarizing what happened (executed/queued/blocked, or "no trades
+proposed"). Both are best-effort -- see the next section if you don't see
+them.
+
+## macOS notification setup (one-time)
+
+Install terminal-notifier, send a test, and -- the step that actually
+mattered on this machine -- **reboot if nothing appears**:
+
+```bash
+brew install terminal-notifier
+python -c "from src.notify import send_macos_notification as n; n('Autonomous Trader', 'test notification')"
+```
+
+Real sequence observed here (2026-07-06): right after install,
+terminal-notifier exited 0 but posted nothing -- no banner, no permission
+prompt, not even an entry in System Settings -> Notifications, and
+launching its .app bundle directly didn't register it either. After a
+machine RESTART it appeared in System Settings -> Notifications, could be
+enabled, and worked. So: if it looks broken right after install, reboot
+before debugging anything else. Once working, confirm alerts/banners are
+enabled under its name in System Settings -> Notifications if you ever
+stop seeing them.
+
+`src/notify.py` tries terminal-notifier first, then a locally-compiled
+AppleScript applet (`~/Applications/AutonomousTraderNotifier.app`, built
+by `scripts/setup_notifier_applet.sh` -- created as a replacement during
+the pre-reboot window when terminal-notifier appeared broken, kept as a
+fallback for machines without terminal-notifier; note it did NOT visibly
+post on this machine), then bare
+`osascript -e 'display notification ...'` (confirmed a silent no-op on
+current macOS even after a restart -- no app identity behind it). All
+three are checked fresh on every call, so installing/removing any of them
+needs no code change or reload.

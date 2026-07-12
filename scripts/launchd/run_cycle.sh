@@ -1,5 +1,5 @@
 #!/bin/bash
-# Wrapper invoked by launchd at 9:40am / 2:30pm / 3:50pm ET on weekdays
+# Wrapper invoked by launchd at 9:20am / 1:30pm / 3:50pm ET on weekdays
 # (see com.ryan.autonomous-trader.run-cycle.plist in this directory).
 #
 # launchd does NOT inherit your interactive shell's PATH or conda setup, so
@@ -17,7 +17,7 @@
 # side decide whether there's actually anything to do.
 set -euo pipefail
 
-PROJECT_DIR="/Users/ryanlazar/Documents/AutonomousTrader"
+PROJECT_DIR="/Users/ryanlazar/dev/AutonomousTrader"
 
 PYTHON_BIN="/opt/anaconda3/bin/python"
 

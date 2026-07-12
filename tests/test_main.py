@@ -1,8 +1,10 @@
+from unittest.mock import patch
+
 import pytest
 
 from src.agents.execution import ExecutionRequest, ExecutionResult
 from src.agents.portfolio_manager import CandidateTradeProposal
-from src.main import is_trading_halted, process_candidate_trade
+from src.main import _notify_cycle_summary, is_trading_halted, process_candidate_trade
 from src.risk.safety_rails import SafetyState
 from src.risk.scorer import RiskScorerConfig
 
@@ -215,3 +217,124 @@ class TestProcessCandidateTrade:
             log_audit=deps.log_audit,
         )
         assert outcome == "blocked"
+
+
+class TestNotifyApprovalNeeded:
+    def test_called_with_proposal_and_risk_result_when_queued(self):
+        deps = FakeCycleDeps()
+        notify_calls = []
+        proposal = make_proposal(quantity=1.0)
+        process_candidate_trade(
+            proposal,
+            proposed_price=100.0,
+            total_portfolio_value=100_000.0,
+            asset_30d_volatility=0.20,
+            benchmark_30d_volatility=0.02,
+            liquidity_penalty=100.0,
+            insert_candidate_trade=deps.insert_candidate_trade,
+            insert_approval_queue_item=deps.insert_approval_queue_item,
+            execute_trade_fn=deps.execute_trade_fn,
+            log_audit=deps.log_audit,
+            risk_config=RiskScorerConfig(approval_threshold=40.0),
+            notify_approval_needed=lambda p, r: notify_calls.append((p, r)),
+        )
+        assert len(notify_calls) == 1
+        called_proposal, called_risk_result = notify_calls[0]
+        assert called_proposal == proposal
+        assert called_risk_result.needs_approval is True
+
+    def test_not_called_when_auto_approved(self):
+        deps = FakeCycleDeps()
+        notify_calls = []
+        process_candidate_trade(
+            make_proposal(quantity=1.0),
+            proposed_price=100.0,
+            total_portfolio_value=100_000.0,
+            asset_30d_volatility=0.01,
+            benchmark_30d_volatility=0.01,
+            liquidity_penalty=0.0,
+            insert_candidate_trade=deps.insert_candidate_trade,
+            insert_approval_queue_item=deps.insert_approval_queue_item,
+            execute_trade_fn=deps.execute_trade_fn,
+            log_audit=deps.log_audit,
+            notify_approval_needed=lambda p, r: notify_calls.append((p, r)),
+        )
+        assert notify_calls == []
+
+    def test_defaults_to_none_without_error(self):
+        # Every existing test above omits notify_approval_needed entirely --
+        # this just makes the default-None, no-op behavior explicit.
+        deps = FakeCycleDeps()
+        outcome = process_candidate_trade(
+            make_proposal(quantity=1.0),
+            proposed_price=100.0,
+            total_portfolio_value=100_000.0,
+            asset_30d_volatility=0.20,
+            benchmark_30d_volatility=0.02,
+            liquidity_penalty=100.0,
+            insert_candidate_trade=deps.insert_candidate_trade,
+            insert_approval_queue_item=deps.insert_approval_queue_item,
+            execute_trade_fn=deps.execute_trade_fn,
+            log_audit=deps.log_audit,
+            risk_config=RiskScorerConfig(approval_threshold=40.0),
+        )
+        assert outcome == "queued_for_approval"
+
+
+class TestNotifyCycleSummary:
+    @patch("src.notify.send_macos_notification")
+    def test_counts_each_outcome_type_into_the_message(self, mock_notify):
+        _notify_cycle_summary(5, ["executed", "executed", "queued_for_approval", "blocked", "execution_failed"])
+        assert mock_notify.called
+        message = mock_notify.call_args.kwargs["message"]
+        assert "2 executed" in message
+        assert "1 queued for approval" in message
+        assert "1 blocked" in message
+        assert "1 failed" in message
+        assert "5 trade(s) proposed" in message
+
+    @patch("src.notify.send_macos_notification")
+    def test_proposals_that_never_reached_process_candidate_trade_count_as_skipped(self, mock_notify):
+        # 3 proposed, but only 1 outcome recorded -- the other 2 were
+        # dropped earlier in the loop for missing price/volatility data.
+        _notify_cycle_summary(3, ["executed"])
+        message = mock_notify.call_args.kwargs["message"]
+        assert "2 skipped (no price/volatility data)" in message
+
+    @patch("src.notify.send_macos_notification")
+    def test_empty_outcomes_still_sends_a_notification(self, mock_notify):
+        _notify_cycle_summary(0, [])
+        assert mock_notify.called
+
+
+class TestProcessCandidateTradeCashPassthrough:
+    """cash_available must reach the ExecutionRequest handed to the
+    Execution Agent -- that's the whole delivery path of the no-margin
+    safety rail from run_cycle's running remaining-cash figure (see
+    risk/safety_rails.py for the rail itself)."""
+
+    def _run(self, **kwargs):
+        deps = FakeCycleDeps()
+        outcome = process_candidate_trade(
+            make_proposal(quantity=1.0),
+            proposed_price=100.0,
+            total_portfolio_value=100_000.0,
+            asset_30d_volatility=0.01,
+            benchmark_30d_volatility=0.01,
+            liquidity_penalty=0.0,
+            insert_candidate_trade=deps.insert_candidate_trade,
+            insert_approval_queue_item=deps.insert_approval_queue_item,
+            execute_trade_fn=deps.execute_trade_fn,
+            log_audit=deps.log_audit,
+            **kwargs,
+        )
+        return outcome, deps
+
+    def test_cash_available_is_passed_through_to_execution_request(self):
+        outcome, deps = self._run(cash_available=1_234.56)
+        assert outcome == "executed"
+        assert deps.execute_trade_calls[0].cash_available == 1_234.56
+
+    def test_defaults_to_none_when_not_supplied(self):
+        outcome, deps = self._run()
+        assert deps.execute_trade_calls[0].cash_available is None

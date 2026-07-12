@@ -46,21 +46,21 @@ class TestComputeLookbackStart:
 
     def test_first_slot_of_day_looks_back_to_previous_session_close(self):
         previous_close = datetime(2026, 7, 2, 16, 0, tzinfo=self.ET)  # previous Thursday close
-        now = self._dt(9, 41)  # just after the 9:40 slot fires
+        now = self._dt(9, 21)  # just after the 9:20 slot fires
         result = compute_lookback_start(now, previous_close)
         assert result == previous_close
 
     def test_second_slot_looks_back_to_first_slot_same_day(self):
         previous_close = datetime(2026, 7, 6, 9, 30, tzinfo=self.ET)  # today's open, irrelevant here
-        now = self._dt(14, 31)  # just after the 2:30pm slot fires
+        now = self._dt(13, 31)  # just after the 1:30pm slot fires
         result = compute_lookback_start(now, previous_close)
-        assert result == self._dt(9, 40)
+        assert result == self._dt(9, 20)
 
     def test_third_slot_looks_back_to_second_slot_same_day(self):
         previous_close = self._dt(9, 30)
         now = self._dt(15, 51)  # just after the 3:50pm slot fires
         result = compute_lookback_start(now, previous_close)
-        assert result == self._dt(14, 30)
+        assert result == self._dt(13, 30)
 
     def test_invoked_before_any_scheduled_slot_looks_back_to_previous_close(self):
         # e.g. a manual ad-hoc dry run at 8am, before the first real slot.
@@ -83,7 +83,7 @@ class TestComputeLookbackStart:
         # naive "yesterday" is what makes Monday-morning runs correctly
         # span the whole weekend -- confirmed here with a Friday close.
         previous_close = datetime(2026, 7, 3, 16, 0, tzinfo=self.ET)  # the preceding Friday
-        now = self._dt(9, 41)  # Monday morning
+        now = self._dt(9, 21)  # Monday morning
         result = compute_lookback_start(now, previous_close)
         assert result == previous_close
         assert result.weekday() == 4  # Friday

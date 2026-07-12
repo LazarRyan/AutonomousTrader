@@ -84,9 +84,17 @@ class DailySchedule:
     exchange's local time zone. Must be given in ascending order -- the
     constructor does not sort them, so a caller passing them out of order
     gets wrong (but deterministic) behavior rather than a silent fix-up.
+
+    9:20am is deliberately before the 9:30am open -- this slot's job is to
+    scan and get pre-open orders queued (Alpaca queues a regular DAY market
+    order submitted before the open for the opening cross rather than
+    rejecting it), not to trade against a live quote. Must stay in sync with
+    scripts/launchd/com.ryan.autonomous-trader.run-cycle.plist's
+    StartCalendarInterval -- this default only drives the lookback-window
+    math below, it does not control when launchd actually fires.
     """
 
-    slot_times: tuple[dtime, ...] = (dtime(9, 40), dtime(14, 30), dtime(15, 50))
+    slot_times: tuple[dtime, ...] = (dtime(9, 20), dtime(13, 30), dtime(15, 50))
 
 
 def compute_lookback_start(
@@ -105,12 +113,12 @@ def compute_lookback_start(
 
     Behavior:
       - If `now` is at or before the first scheduled slot of the day (or
-        earlier -- e.g. a manual/ad-hoc run before 9:40), looks back to
+        earlier -- e.g. a manual/ad-hoc run before 9:20am), looks back to
         `previous_session_close`. This is what makes a Monday-morning run
         correctly span the whole weekend, and a post-holiday run span the
         holiday, without hardcoding a fixed hour count anywhere.
       - Otherwise, looks back to the immediately preceding scheduled slot
-        the same day (e.g. the 2:30pm run looks back to 9:40am).
+        the same day (e.g. the 1:30pm run looks back to 9:20am).
     """
     schedule = schedule or DailySchedule()
     slots_today = sorted(schedule.slot_times)

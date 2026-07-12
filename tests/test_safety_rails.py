@@ -148,3 +148,75 @@ def test_rejects_nonpositive_portfolio_value():
     state = SafetyState()
     with pytest.raises(ValueError):
         evaluate_trade(trade_value=100, total_portfolio_value=0, state=state)
+
+
+# --- No-margin rail (insufficient_cash) -- added 2026-07-07 after the real
+# account's cash went negative: Alpaca (paper included) is a margin account
+# by default and nothing upstream ever checked cash before buying.
+
+
+def test_buy_exceeding_available_cash_is_blocked():
+    state = SafetyState()
+    decision = evaluate_trade(
+        trade_value=5_000, total_portfolio_value=100_000, state=state,
+        side="buy", cash_available=4_000,
+    )
+    assert decision.allowed is False
+    assert any("insufficient_cash" in r for r in decision.reasons)
+
+
+def test_buy_within_available_cash_is_allowed():
+    state = SafetyState()
+    decision = evaluate_trade(
+        trade_value=3_999, total_portfolio_value=100_000, state=state,
+        side="buy", cash_available=4_000,
+    )
+    assert decision.allowed is True
+
+
+def test_sell_is_never_cash_blocked():
+    # Sells RAISE cash -- even an account already sitting on a margin debit
+    # (negative cash) must be allowed to sell its way back out.
+    state = SafetyState()
+    decision = evaluate_trade(
+        trade_value=5_000, total_portfolio_value=100_000, state=state,
+        side="sell", cash_available=-1_000,
+    )
+    assert decision.allowed is True
+
+
+def test_negative_cash_blocks_every_buy():
+    # The exact state that motivated this rail: cash already negative means
+    # any further buy is pure margin borrowing.
+    state = SafetyState()
+    decision = evaluate_trade(
+        trade_value=1, total_portfolio_value=100_000, state=state,
+        side="buy", cash_available=-0.01,
+    )
+    assert decision.allowed is False
+    assert any("insufficient_cash" in r for r in decision.reasons)
+
+
+def test_cash_available_none_skips_the_no_margin_check():
+    # Backwards-compatible escape hatch for callers with no cash figure --
+    # both real execution paths always pass one.
+    state = SafetyState()
+    decision = evaluate_trade(
+        trade_value=1_000_000_000, total_portfolio_value=100_000_000_000, state=state,
+        side="buy", cash_available=None,
+    )
+    assert decision.allowed is True
+
+
+def test_cash_block_reported_alongside_other_failures_not_instead():
+    # All rails are evaluated, not just the first failure, so the audit row
+    # captures every reason at once.
+    state = SafetyState(kill_switch_engaged=True)
+    decision = evaluate_trade(
+        trade_value=20_000, total_portfolio_value=100_000, state=state,
+        side="buy", cash_available=0,
+    )
+    assert decision.allowed is False
+    assert any("kill_switch" in r for r in decision.reasons)
+    assert any("max_position_size" in r for r in decision.reasons)
+    assert any("insufficient_cash" in r for r in decision.reasons)
