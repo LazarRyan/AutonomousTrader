@@ -145,6 +145,31 @@ def parse_position_note_thesis(note_text: str) -> str | None:
     return thesis or None
 
 
+# The machine-readable exit-target line the nightly reflection appends to
+# a thesis (see reflection.format_thesis_with_targets). Lives inside the
+# thesis text on purpose: the portfolio manager sees targets as part of
+# the thesis it reads, Obsidian shows them where a human looks for them,
+# and this one regex is the entire "schema".
+_EXIT_TARGETS_RE = re.compile(
+    r"^Exit targets:(?:\s+above \$(?P<above>[\d,]+(?:\.\d+)?))?(?:\s*·\s*)?(?:\s*below \$(?P<below>[\d,]+(?:\.\d+)?))?\s*$",
+    re.MULTILINE,
+)
+
+
+def parse_exit_targets(thesis_text: str) -> tuple[float | None, float | None]:
+    """(exit_above, exit_below) from a thesis's 'Exit targets:' line, or
+    (None, None) when the thesis has no targets -- an old-format thesis is
+    a thesis without targets, never an error. Pure, unit-tested."""
+    match = _EXIT_TARGETS_RE.search(thesis_text)
+    if not match:
+        return None, None
+
+    def _num(raw: str | None) -> float | None:
+        return float(raw.replace(",", "")) if raw else None
+
+    return _num(match.group("above")), _num(match.group("below"))
+
+
 def read_position_thesis(vault: Vault, symbol: str) -> str | None:
     path = vault.position_path(symbol)
     if not path.exists():

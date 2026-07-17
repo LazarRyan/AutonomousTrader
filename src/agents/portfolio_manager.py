@@ -151,6 +151,16 @@ class HoldingSnapshot:
     symbol: str
     quantity: float
     avg_entry_price: float
+    # Live mark + unrealized P&L (2026-07-17): before these existed, the
+    # model saw holdings only as quantity + entry price -- a 1.77%
+    # intraday portfolio pop was structurally invisible to it, and the
+    # exit conditions its own theses specified ("exit below $25.28") were
+    # unevaluable. Optional (None = not available this cycle) so existing
+    # callers/tests and a failed price fetch degrade to the old rendering
+    # rather than showing fake numbers. unrealized_pnl_pct is a fraction
+    # (0.032 = +3.2%), matching Alpaca's unrealized_plpc.
+    current_price: float | None = None
+    unrealized_pnl_pct: float | None = None
 
 
 @dataclass(frozen=True)
@@ -190,6 +200,16 @@ You may also be given per-symbol fundamentals (sector, P/E, next earnings date) 
 assessment. Factor them in: avoid initiating new positions within 2 trading days before an earnings
 report unless your reasoning explicitly justifies holding through the print, and size/propose more
 conservatively in a risk-off regime.
+
+Holdings may include their current price and unrealized P&L, and a position's thesis may specify
+explicit exit targets (e.g. "Exit targets: above $28.00 · below $23.50"); crossed targets may be
+flagged for you explicitly. Use these with discipline:
+- A met exit target, a broken thesis, or a deteriorating signal IS a reason to propose a sell --
+  evaluate each holding's thesis conditions against its current price every cycle.
+- Strength alone is NOT a reason to sell. Do not propose exits merely because a position is up;
+  cutting winners early while holding losers (the disposition effect) is a documented way to
+  underperform. If you sell into strength, your reasoning must name the thesis condition or signal
+  change that justifies it -- "locking in gains" by itself is not a justification.
 
 Propose zero or more candidate trades. You are NOT responsible for risk approval or position-size
 limits -- a separate deterministic system enforces those after you propose. However, use reasonable
@@ -236,10 +256,16 @@ def build_portfolio_manager_prompt(
     )
 
     if portfolio.holdings:
-        holdings_lines = "\n".join(
-            f"  {h.symbol}: {h.quantity} shares @ avg entry ${h.avg_entry_price:.2f}"
-            for h in portfolio.holdings
-        )
+
+        def _holding_line(h: HoldingSnapshot) -> str:
+            line = f"  {h.symbol}: {h.quantity} shares @ avg entry ${h.avg_entry_price:.2f}"
+            if h.current_price is not None:
+                line += f", now ${h.current_price:.2f}"
+            if h.unrealized_pnl_pct is not None:
+                line += f" ({h.unrealized_pnl_pct:+.1%} unrealized)"
+            return line
+
+        holdings_lines = "\n".join(_holding_line(h) for h in portfolio.holdings)
     else:
         holdings_lines = "  (no current holdings)"
 

@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "README.md",
+                "file": "Journal/2026-07-17.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "README"
+              "title": "2026-07-17"
             }
           }
         ]
@@ -183,8 +183,9 @@
       "bases:Create new base": false
     }
   },
-  "active": "f6afb708224157a9",
+  "active": "38399409f07ff734",
   "lastOpenFiles": [
+    "README.md",
     "Journal/2026-07-17.md",
     "Positions/BAX.md",
     "Newsletters/2026-07-16.md",

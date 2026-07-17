@@ -209,13 +209,36 @@ Produce:
    produced it. If there are no closed lots, or the closed lots teach nothing new beyond the existing
    lessons, return an empty array -- fabricating lessons from unrealized moves or hunches is worse than
    silence. A lesson about a signal source being unreliable is valid if the evidence shows it.
-3. "theses": for EVERY current open position, one or two sentences: why this position is worth holding
-   now, and what specific observable condition should trigger an exit. Base it on the entry reasoning and
-   current P&L shown -- do not invent facts about the companies.
+3. "theses": for EVERY current open position, an object with:
+   - "thesis": one or two sentences -- why this position is worth holding now, and what observable
+     condition should trigger an exit. Base it on the entry reasoning and current P&L shown -- do not
+     invent facts about the companies.
+   - "exit_below": a concrete stop price (number) below which the thesis is invalidated and the
+     position should be exited. Anchor it to the entry price and current price shown -- e.g. a level
+     that represents an unacceptable loss or a broken setup. Required for every position.
+   - "exit_above": a profit-target price (number) at which the thesis is fulfilled and gains should be
+     taken, or null if the thesis is open-ended (a long-term hold with no specific target). Only set a
+     number when the thesis genuinely implies one -- do not invent tight targets that would force
+     selling winners early.
+   These targets are checked against live prices every trading cycle, so they must be actionable
+   numbers, not vague levels.
 
 Your ENTIRE reply must be a single JSON object and nothing else -- the very first character must be "{{":
-{{"journal_summary": "<text>", "lessons": ["<rule>"], "theses": {{"<TICKER>": "<thesis>"}}}}
+{{"journal_summary": "<text>", "lessons": ["<rule>"], "theses": {{"<TICKER>": {{"thesis": "<text>", "exit_below": <number>, "exit_above": <number or null>}}}}}}
 """
+
+
+def format_thesis_with_targets(thesis: str, exit_above: float | None, exit_below: float | None) -> str:
+    """Append the machine-readable 'Exit targets:' line vault.parse_exit_targets
+    reads back. No targets -> thesis unchanged. Pure, unit-tested."""
+    parts = []
+    if exit_above is not None:
+        parts.append(f"above ${exit_above:,.2f}")
+    if exit_below is not None:
+        parts.append(f"below ${exit_below:,.2f}")
+    if not parts:
+        return thesis
+    return f"{thesis.strip()}\n\nExit targets: {' · '.join(parts)}"
 
 
 def parse_reflection_response(response_text: str) -> ReflectionResult:
@@ -255,11 +278,28 @@ def parse_reflection_response(response_text: str) -> ReflectionResult:
     theses_raw = payload.get("theses", {})
     if not isinstance(theses_raw, dict):
         raise ValueError("Reflection 'theses' must be an object")
-    theses = {
-        symbol.strip().upper(): thesis.strip()
-        for symbol, thesis in theses_raw.items()
-        if isinstance(symbol, str) and isinstance(thesis, str) and symbol.strip() and thesis.strip()
-    }
+    theses: dict[str, str] = {}
+    for symbol, value in theses_raw.items():
+        if not isinstance(symbol, str) or not symbol.strip():
+            continue
+        # Two accepted shapes: the current object form ({"thesis", "exit_below",
+        # "exit_above"}) and the original bare-string form -- the model was
+        # trained on the old contract for its first nights, and a per-symbol
+        # malformed entry is skipped, not fatal (same posture as proposals).
+        if isinstance(value, str) and value.strip():
+            theses[symbol.strip().upper()] = value.strip()
+        elif isinstance(value, dict):
+            thesis_text = value.get("thesis")
+            if not isinstance(thesis_text, str) or not thesis_text.strip():
+                print(f"Reflection thesis for {symbol!r} has missing/invalid 'thesis' -- skipping: {value!r}")
+                continue
+
+            def _target(raw) -> float | None:
+                return float(raw) if isinstance(raw, (int, float)) and raw > 0 else None
+
+            theses[symbol.strip().upper()] = format_thesis_with_targets(
+                thesis_text, _target(value.get("exit_above")), _target(value.get("exit_below"))
+            )
 
     return ReflectionResult(journal_summary=journal_summary.strip(), lessons=lessons, theses_by_symbol=theses)
 

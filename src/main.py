@@ -496,7 +496,16 @@ def run_cycle(
     # AND the universe's held-position component below.
     positions = alpaca_trading_client.get_all_positions()
     holdings = [
-        HoldingSnapshot(symbol=p.symbol, quantity=float(p.qty), avg_entry_price=float(p.avg_entry_price))
+        HoldingSnapshot(
+            symbol=p.symbol,
+            quantity=float(p.qty),
+            avg_entry_price=float(p.avg_entry_price),
+            # Live mark + unrealized P&L (2026-07-17) -- see HoldingSnapshot's
+            # docstring for why. getattr-guarded: None degrades the prompt to
+            # the old entry-price-only rendering, never fakes a number.
+            current_price=(float(p.current_price) if getattr(p, "current_price", None) is not None else None),
+            unrealized_pnl_pct=(float(p.unrealized_plpc) if getattr(p, "unrealized_plpc", None) is not None else None),
+        )
         for p in positions
     ]
     held_symbols = {h.symbol.upper() for h in holdings}
@@ -581,6 +590,40 @@ def run_cycle(
             if thesis:
                 theses[held] = thesis
         memory_context = build_memory_context(recent_actions, theses, read_lessons(vault), read_scorecard(vault))
+
+        # ---- Thesis exit-target check (2026-07-17): the deterministic half
+        # of "reflection sets targets, cycles check them". The reflection
+        # writes concrete exit prices into each thesis; here every held
+        # position's live price is compared against them, and crossings are
+        # flagged LOUDLY in the prompt (plus an audit row). The decision to
+        # actually sell stays with the portfolio manager -- a stop that
+        # auto-fires is a different (deterministic-rail) design; this one
+        # makes the thesis's own exit condition impossible to not see.
+        from src.memory.vault import parse_exit_targets
+
+        price_by_symbol = {h.symbol.upper(): h.current_price for h in holdings if h.current_price is not None}
+        target_alerts: list[str] = []
+        for held, thesis in theses.items():
+            price = price_by_symbol.get(held)
+            if price is None:
+                continue
+            exit_above, exit_below = parse_exit_targets(thesis)
+            alert = None
+            if exit_above is not None and price >= exit_above:
+                alert = (
+                    f"{held}: current price ${price:.2f} is AT/ABOVE the thesis profit target "
+                    f"${exit_above:,.2f} -- thesis fulfilled, evaluate taking gains"
+                )
+            elif exit_below is not None and price <= exit_below:
+                alert = (
+                    f"{held}: current price ${price:.2f} is AT/BELOW the thesis stop "
+                    f"${exit_below:,.2f} -- thesis invalidated, evaluate exiting"
+                )
+            if alert:
+                target_alerts.append(f"  {alert}")
+                log_audit(event_type="thesis_target", decision="target_crossed", reasoning=alert, symbol=held)
+        if target_alerts:
+            memory_context += "\n\nTHESIS TARGET ALERTS (a target your own thesis set has been crossed -- address each in your reasoning):\n" + "\n".join(target_alerts)
     except Exception as exc:  # noqa: BLE001 -- memory is an enhancement; stateless is the fallback, not a crash
         print(f"memory recall failed, running this cycle stateless: {exc}")
 
