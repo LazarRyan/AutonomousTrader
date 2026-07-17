@@ -128,6 +128,62 @@ def build_memory_context(
 
 
 # ============================================================
+# Citation verification (2026-07-17, observability tier 1): the system
+# prompt tells the model to cite a lesson when it changes a decision, and
+# the ops metrics count those citations -- but a count trusts the model's
+# word. This closes the loop deterministically: when reasoning CLAIMS a
+# lesson, check that some actual vault lesson shares enough distinctive
+# vocabulary with the reasoning to plausibly be the one cited. Cheap
+# string math, no LLM -- the fuzzy remainder (was the cited lesson
+# genuinely relevant?) is future judge-eval territory, but "did the cited
+# lesson exist at all" should never cost tokens to answer.
+# ============================================================
+
+import re as _re
+
+# Words too common in this domain to indicate WHICH lesson is being cited.
+_CITATION_STOPWORDS = {
+    "the", "and", "for", "not", "with", "was", "were", "that", "this", "than",
+    "but", "its", "are", "has", "have", "had", "when", "then", "will", "would",
+    "signal", "signals", "score", "scores", "position", "positions", "trade",
+    "trades", "trading", "buy", "sell", "bullish", "bearish", "lesson", "lessons",
+}
+
+_LESSON_LINE_PREFIX_RE = _re.compile(r"^- \[\d{4}-\d{2}-\d{2}\]\s*")
+
+
+def _content_words(text: str) -> set[str]:
+    return {w for w in _re.findall(r"[a-z]{3,}", text.lower()) if w not in _CITATION_STOPWORDS}
+
+
+def verify_lesson_citation(reasoning: str, lessons_markdown: str, min_overlap: float = 0.35) -> bool | None:
+    """None: the reasoning doesn't claim a lesson (nothing to verify).
+    True: it claims one, and an actual vault lesson shares >= min_overlap
+    of its distinctive vocabulary with the reasoning. False: it claims one
+    no vault lesson plausibly matches -- a fabricated or garbled citation,
+    which is exactly the failure mode worth surfacing. Pure, unit-tested."""
+    if "lesson" not in reasoning.lower():
+        return None
+
+    lesson_lines = [
+        _LESSON_LINE_PREFIX_RE.sub("", line)
+        for line in lessons_markdown.splitlines()
+        if line.startswith("- [")
+    ]
+    if not lesson_lines:
+        return False  # cites a lesson while the vault has none -- fabricated by definition
+
+    reasoning_words = _content_words(reasoning)
+    for lesson in lesson_lines:
+        lesson_words = _content_words(lesson)
+        if not lesson_words:
+            continue
+        if len(lesson_words & reasoning_words) / len(lesson_words) >= min_overlap:
+            return True
+    return False
+
+
+# ============================================================
 # Thin glue -- one Supabase query + vault file reads.
 # ============================================================
 

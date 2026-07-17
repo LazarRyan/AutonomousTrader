@@ -196,3 +196,23 @@ create table if not exists llm_calls (
 create index if not exists idx_llm_calls_created_at on llm_calls (created_at desc);
 
 alter table llm_calls enable row level security;
+
+-- ============================================================
+-- 2026-07-17: context snapshots (applied to the live project as migration
+-- context_snapshots). The exact memory/market context injected into the
+-- portfolio manager prompt, one row per cycle -- reproducible answer to
+-- "what did the agent know when it decided X".
+-- ============================================================
+create table if not exists context_snapshots (
+    id uuid primary key default gen_random_uuid(),
+    cycle_at timestamptz not null default now(),
+    memory_context text,
+    market_context text,
+    memory_chars integer not null default 0,
+    market_chars integer not null default 0,
+    metadata jsonb not null default '{}'::jsonb
+);
+
+create index if not exists idx_context_snapshots_cycle_at on context_snapshots (cycle_at desc);
+
+alter table context_snapshots enable row level security;

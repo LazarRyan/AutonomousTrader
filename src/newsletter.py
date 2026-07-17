@@ -113,6 +113,12 @@ class OpsMetrics:
     guard_interventions: dict[str, int]      # label -> count (only guards that fired)
     trades_citing_lessons: int               # today's proposals whose reasoning references a lesson
     total_trades: int
+    # From audit_log citation_check rows (2026-07-17): citations checked
+    # deterministically against the vault. Verified = a matching lesson
+    # exists; unverified = the reasoning claimed a lesson no vault lesson
+    # plausibly matches (fabrication -- worth seeing in the letter).
+    citations_verified: int = 0
+    citations_unverified: int = 0
 
 
 def build_ops_metrics(
@@ -141,10 +147,16 @@ def build_ops_metrics(
         output_tokens += int(row.get("output_tokens", 0) or 0)
 
     guard_interventions: dict[str, int] = {}
+    citations_verified = citations_unverified = 0
     for row in audit_rows:
-        label = GUARD_DECISION_LABELS.get(row.get("decision", ""))
+        decision = row.get("decision", "")
+        label = GUARD_DECISION_LABELS.get(decision)
         if label:
             guard_interventions[label] = guard_interventions.get(label, 0) + 1
+        elif decision == "citation_verified":
+            citations_verified += 1
+        elif decision == "citation_unverified":
+            citations_unverified += 1
 
     trades_citing = sum(1 for reasoning in trade_reasonings if _LESSON_CITATION_MARKER in (reasoning or "").lower())
 
@@ -157,6 +169,8 @@ def build_ops_metrics(
         guard_interventions=guard_interventions,
         trades_citing_lessons=trades_citing,
         total_trades=len(trade_reasonings),
+        citations_verified=citations_verified,
+        citations_unverified=citations_unverified,
     )
 
 
@@ -250,10 +264,21 @@ def render_newsletter(
         else:
             lines.append("Discipline layer: no interventions needed today.")
         if ops_metrics.total_trades:
-            lines.append(
+            citation_line = (
                 f"Memory in action: {ops_metrics.trades_citing_lessons} of {ops_metrics.total_trades} "
-                f"proposal(s) cited a learned lesson in their reasoning."
+                f"proposal(s) cited a learned lesson in their reasoning"
             )
+            if ops_metrics.citations_verified or ops_metrics.citations_unverified:
+                citation_line += (
+                    f" ({ops_metrics.citations_verified} verified against the vault"
+                    + (
+                        f", {ops_metrics.citations_unverified} NOT matching any vault lesson"
+                        if ops_metrics.citations_unverified
+                        else ""
+                    )
+                    + ")"
+                )
+            lines.append(citation_line + ".")
 
     lines += [
         "",
@@ -444,10 +469,19 @@ def render_newsletter_html(
                 f'<p style="margin:4px 0; color:{_MUTED_COLOR};">Discipline layer: no interventions needed today.</p>'
             )
         if ops_metrics.total_trades:
-            parts.append(
-                f'<p style="margin:4px 0;">Memory in action: {ops_metrics.trades_citing_lessons} of '
-                f"{ops_metrics.total_trades} proposal(s) cited a learned lesson in their reasoning.</p>"
+            citation_html = (
+                f"Memory in action: {ops_metrics.trades_citing_lessons} of "
+                f"{ops_metrics.total_trades} proposal(s) cited a learned lesson in their reasoning"
             )
+            if ops_metrics.citations_verified or ops_metrics.citations_unverified:
+                citation_html += f" ({ops_metrics.citations_verified} verified against the vault"
+                if ops_metrics.citations_unverified:
+                    citation_html += (
+                        f', <span style="color:{_NEGATIVE_COLOR}; font-weight:600;">'
+                        f"{ops_metrics.citations_unverified} NOT matching any vault lesson</span>"
+                    )
+                citation_html += ")"
+            parts.append(f'<p style="margin:4px 0;">{citation_html}.</p>')
 
     parts.append(
         f'<p style="margin-top:28px; padding-top:12px; border-top:{_BORDER}; color:{_MUTED_COLOR}; font-size:12px;">'

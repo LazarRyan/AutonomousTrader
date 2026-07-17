@@ -403,8 +403,10 @@ def run_reflection(supabase_client, alpaca_trading_client, settings, vault, toda
         raise last_error
 
     # Write memory -- loudly (see module docstring).
+    # [[SYM]] wiki-links: journal <-> position notes stay a navigable graph
+    # in Obsidian (same convention as run_cycle's journal writes).
     realized_lines = "\n".join(
-        f"- {lot.symbol}: {lot.realized_pnl_pct:+.2%} (${lot.realized_pnl:+,.2f}) on {lot.quantity:g} sh, "
+        f"- [[{lot.symbol}]]: {lot.realized_pnl_pct:+.2%} (${lot.realized_pnl:+,.2f}) on {lot.quantity:g} sh, "
         f"held {(lot.exit_at - lot.entry_at).days}d"
         for lot in recent_lots
     )
@@ -420,6 +422,8 @@ def run_reflection(supabase_client, alpaca_trading_client, settings, vault, toda
     open_symbols = {p.symbol.upper() for p in open_positions}
     for symbol, thesis in result.theses_by_symbol.items():
         if symbol in open_symbols:  # never write a thesis for a position we don't hold
-            upsert_position_note(vault, symbol, thesis, history_line=f"{today.isoformat()}: thesis refreshed by nightly reflection")
+            upsert_position_note(
+                vault, symbol, thesis, history_line=f"[[{today.isoformat()}]]: thesis refreshed by nightly reflection"
+            )
 
     return result

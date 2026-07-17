@@ -700,6 +700,29 @@ def run_cycle(
         if snapshot and snapshot.sector and market_value is not None:
             sector_exposure_value[snapshot.sector] = sector_exposure_value.get(snapshot.sector, 0.0) + float(market_value)
 
+    # ---- Context snapshot (2026-07-17): persist the EXACT memory/market
+    # context this cycle's prompt carries, before the model sees it.
+    # Observability tier 1 -- "what did the agent know when it decided X"
+    # becomes a queryable fact instead of a reconstruction. Best-effort:
+    # snapshot failure must never cost a trading cycle.
+    try:
+        supabase_client.table("context_snapshots").insert(
+            {
+                "memory_context": memory_context,
+                "market_context": market_context,
+                "memory_chars": len(memory_context or ""),
+                "market_chars": len(market_context or ""),
+                "metadata": {
+                    "universe_size": len(universe),
+                    "symbols_with_signals": len(blended_scores),
+                    "held_positions": len(holdings),
+                    "regime": regime.label if regime else None,
+                },
+            }
+        ).execute()
+    except Exception as exc:  # noqa: BLE001
+        print(f"context snapshot write failed (non-blocking): {exc}")
+
     from src.llm_metering import make_recorder
 
     proposals = propose_candidate_trades(
@@ -742,7 +765,13 @@ def run_cycle(
         # end-of-cycle journal write below.
         try:
             top_scores = sorted(blended_scores.items(), key=lambda kv: abs(kv[1]), reverse=True)[:5]
-            scores_text = ", ".join(f"{s} {v:+.1f}" for s, v in top_scores)
+            # [[SYM]] wiki-links (2026-07-17): resolve to Positions/SYM.md in
+            # Obsidian for held names, making the journal <-> positions
+            # graph navigable (and giving graph-shaped retrieval something
+            # real to traverse later).
+            scores_text = ", ".join(
+                (f"[[{s}]] {v:+.1f}" if s.upper() in held_symbols else f"{s} {v:+.1f}") for s, v in top_scores
+            )
             append_journal_entry(
                 vault,
                 today,
@@ -765,6 +794,32 @@ def run_cycle(
             message=f"Scanned {len(blended_scores)} symbol(s) -- no trades proposed this cycle.",
         )
         return
+
+    # ---- Citation verification (2026-07-17): when a proposal's reasoning
+    # claims a lesson, deterministically check the claim against the vault
+    # (src.memory.recall.verify_lesson_citation). Purely observational --
+    # never gates the trade -- but a fabricated citation is exactly the
+    # kind of quiet failure the audit trail exists to catch.
+    try:
+        from src.memory.recall import verify_lesson_citation
+
+        lessons_markdown = read_lessons(vault)
+        for proposal in proposals:
+            verified = verify_lesson_citation(proposal.reasoning, lessons_markdown)
+            if verified is None:
+                continue
+            log_audit(
+                event_type="citation_check",
+                decision="citation_verified" if verified else "citation_unverified",
+                reasoning=(
+                    f"reasoning cites a lesson and a matching vault lesson "
+                    f"{'was found' if verified else 'was NOT found -- possible fabricated citation'}: "
+                    f"{proposal.reasoning}"
+                ),
+                symbol=proposal.symbol,
+            )
+    except Exception as exc:  # noqa: BLE001 -- observational only
+        print(f"citation verification failed (non-blocking): {exc}")
 
     place_order, _log_audit_unused, record_executed_trade, update_candidate_trade_status = make_live_dependencies(
         supabase_client, alpaca_trading_client
@@ -1036,10 +1091,13 @@ def run_cycle(
         # a vault write failure must never affect trading.
         if outcome == "executed":
             try:
+                # [[date]] links the history line back to that day's journal
+                # note -- positions <-> journal becomes a navigable graph in
+                # Obsidian (both directions: journal entries link [[SYM]]).
                 append_position_history(
                     vault,
                     proposal.symbol,
-                    f"{today.isoformat()}: {proposal.side.upper()} x{proposal.quantity:g} @ ~${proposed_price:.2f} "
+                    f"[[{today.isoformat()}]]: {proposal.side.upper()} x{proposal.quantity:g} @ ~${proposed_price:.2f} "
                     f"(signal {blended_scores.get(proposal.symbol, 0):+.1f}) -- {proposal.reasoning}",
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1061,7 +1119,7 @@ def run_cycle(
                 f"Regime: {regime.label if regime else 'unavailable'}. "
                 f"Proposals: {len(proposals)}; outcomes: {outcome_counts or 'none reached execution stage'}.\n\n"
                 + "\n".join(
-                    f"- {p.symbol} {p.side.upper()} x{p.quantity:g} (signal {blended_scores.get(p.symbol, 0):+.1f}) -- {p.reasoning}"
+                    f"- [[{p.symbol}]] {p.side.upper()} x{p.quantity:g} (signal {blended_scores.get(p.symbol, 0):+.1f}) -- {p.reasoning}"
                     for p in proposals
                 )
             ),

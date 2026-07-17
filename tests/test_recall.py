@@ -3,6 +3,14 @@ from src.memory.recall import (
     RecentAction,
     build_memory_context,
     summarize_recent_actions,
+    verify_lesson_citation,
+)
+
+LESSONS_MD = (
+    "# Lessons\n\n"
+    "- [2026-07-16] Do not add to a position on an unchanged momentum reading; "
+    "wait for confirmation from a second source.\n"
+    "- [2026-07-15] Congressional filings alone proved unreliable for KHC-style staples names.\n"
 )
 
 
@@ -66,3 +74,29 @@ class TestBuildMemoryContext:
         context = build_memory_context([], {}, "- [2026-07-16] rule X", "| momentum | 12 |")
         assert "- [2026-07-16] rule X" in context
         assert "| momentum | 12 |" in context
+
+
+class TestVerifyLessonCitation:
+    def test_no_citation_claimed_is_none(self):
+        assert verify_lesson_citation("Strong bullish score, initiating a position.", LESSONS_MD) is None
+
+    def test_genuine_citation_verified(self):
+        reasoning = (
+            "Skipping the add: per the lesson about unchanged momentum readings, "
+            "waiting for confirmation from a second source before adding."
+        )
+        assert verify_lesson_citation(reasoning, LESSONS_MD) is True
+
+    def test_fabricated_citation_flagged(self):
+        reasoning = "Selling half per my lesson that tech stocks always drop on Fridays."
+        assert verify_lesson_citation(reasoning, LESSONS_MD) is False
+
+    def test_citation_with_empty_vault_is_fabricated_by_definition(self):
+        assert verify_lesson_citation("Applying the lesson from last week.", "") is False
+
+    def test_paraphrased_citation_still_verified(self):
+        reasoning = (
+            "Lesson applies here: momentum reading is unchanged since the last add, and no "
+            "second source confirmation exists, so no add."
+        )
+        assert verify_lesson_citation(reasoning, LESSONS_MD) is True

@@ -60,6 +60,19 @@ class TestBuildOpsMetrics:
             "sector cap blocks": 1,
         }
 
+    def test_citation_check_rows_counted(self):
+        audit_rows = [
+            {"decision": "citation_verified"},
+            {"decision": "citation_verified"},
+            {"decision": "citation_unverified"},
+            {"decision": "churn_suppressed"},
+        ]
+        metrics = build_ops_metrics([], audit_rows, [])
+        assert metrics.citations_verified == 2
+        assert metrics.citations_unverified == 1
+        # citation rows are not guard interventions
+        assert metrics.guard_interventions == {"churn guard suppressions": 1}
+
     def test_lesson_citation_detection(self):
         reasonings = [
             "Strong signal; per the lesson about unchanged signals, skipping the add elsewhere.",
@@ -85,6 +98,7 @@ class TestOpsMetricsRendering:
             cost_by_type={"news_sentiment": 0.09, "portfolio_manager": 0.13, "reflection": 0.02},
             guard_interventions={"churn guard suppressions": 3},
             trades_citing_lessons=2, total_trades=5,
+            citations_verified=1, citations_unverified=1,
         )
 
     def test_markdown_section(self):
@@ -103,6 +117,7 @@ class TestOpsMetricsRendering:
         assert "48,000 in / 6,200 out" in text
         assert "3 churn guard suppressions" in text
         assert "2 of 5 proposal(s) cited a learned lesson" in text
+        assert "1 verified against the vault, 1 NOT matching any vault lesson" in text
 
     def test_html_section_and_omitted_when_absent(self):
         from datetime import date
