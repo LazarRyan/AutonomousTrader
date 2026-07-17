@@ -1,12 +1,28 @@
 # autonomous-trader
 
-Autonomous **paper-trading** system. Blends a deterministic momentum signal
-with "public investment movement" following (congressional/insider
-disclosures + news sentiment), scores every candidate trade with a
-deterministic composite risk score, auto-executes low-risk trades, and
-queues anything at/above the risk threshold for your explicit approval.
-Hard safety rails (position size, daily/weekly loss halts, kill switch,
-full audit log) apply regardless of anything above.
+Autonomous, **self-learning** **paper-trading** system. Blends a
+deterministic momentum signal with "public investment movement" following
+(congressional/insider disclosures + news sentiment) across every active
+exchange-listed US equity, proposes trades via an LLM portfolio manager
+that reads its own persistent memory (an Obsidian-compatible markdown
+vault of journals, per-position theses, distilled lessons, and a signal
+scorecard), and executes with **full autonomy** -- no human approval gate
+since 2026-07-16. Discipline is deterministic, not hoped for: an
+anti-churn guard, sector concentration cap, liquidity floor,
+regime/volatility-scaled sizing, and non-negotiable safety rails (position
+size, daily/weekly loss halts, kill switch, no-margin, full audit log)
+apply regardless of what the model wants.
+
+A nightly job reflects on realized outcomes (FIFO-matched closed lots vs.
+the exact reasoning that opened them), writes lessons and per-position
+theses with concrete exit targets back into the vault, retunes the signal
+blend weights weekly from each source's measured predictive accuracy, and
+emails a daily HTML letter (performance vs. SPY, every trade with
+reasoning, lessons, ops metrics). Every LLM call is cost-metered
+(`llm_calls`), every cycle's injected context is persisted verbatim
+(`context_snapshots`), and lesson citations in trade reasoning are
+deterministically verified against the vault -- see "The learning system"
+below.
 
 This is a separate project from `investment-monitor`, with its own repo,
 own Supabase project, and its own Alpaca paper keys (the trading toolset is
@@ -87,17 +103,80 @@ real Anthropic API; they only "fail" in a sandboxed environment that can't
 reach api.anthropic.com over the network, which is expected there and not
 a real problem).
 
+## The learning system (2026-07-16)
+
+The stateless-agent era ended when the audit trail showed five separate
+KHC buys across three days, each cycle independently rediscovering the
+same signal with no memory of having acted on it. The learning upgrade,
+in the order information flows:
+
+- **Memory vault** (`vault/`, `src/memory/vault.py`) -- plain markdown,
+  openable directly as an Obsidian vault: `Journal/` (one note per day,
+  one section per cycle -- including no-trade cycles), `Positions/` (one
+  note per symbol: thesis + exit targets + action history), `Lessons.md`
+  (capped at 30, newest first), `Scorecard.md`, `Newsletters/`.
+  Wiki-links (`[[SYM]]` in journals, `[[date]]` in position histories)
+  make it a navigable graph.
+- **Recall** (`src/memory/recall.py`) -- every cycle, the portfolio
+  manager prompt carries the agent's own recent actions, each holding's
+  thesis, the lessons, and the signal scorecard. Holdings include live
+  prices + unrealized P&L, and crossed thesis exit targets are flagged
+  loudly (`thesis_target`/`target_crossed` audit rows). First observable
+  effect: the first memory-informed cycle (2026-07-17 10:00) scanned 59
+  symbols and proposed nothing -- restraint, where the day before it had
+  bought the same signals five times.
+- **Anti-churn guard** (`src/risk/churn_guard.py`) -- deterministic
+  backstop for what the prompt only asks: same-side cooldown (20h) unless
+  the blended score moved >= 15 points (new information), max 2 buys per
+  symbol per 5 days. Sells are never capped -- exits must never be
+  structurally hard.
+- **Nightly reflection** (`src/memory/reflection.py`, 5:30pm via
+  `launchd`) -- FIFO-matches closed lots against the exact entry/exit
+  reasoning, computes realized P&L deterministically (the LLM only
+  distills, never computes), writes lessons (realized outcomes only,
+  never unrealized hunches), and refreshes every open position's thesis
+  with a required stop (`exit_below`) and optional profit target
+  (`exit_above`).
+- **Adaptive blend weights** (`src/signals/weight_tuner.py`, Mondays) --
+  each source's directional hit rate vs. 5-day forward returns over the
+  trailing 30 days becomes next week's blend weights (10% floor per
+  source so no source can be permanently condemned; all-noise reverts to
+  equal weights). Evidence lands in `Scorecard.md`.
+- **Market context** (`src/signals/fundamentals.py`, `src/risk/regime.py`,
+  `src/risk/sizing.py`) -- yfinance fundamentals + earnings-date warnings
+  in the prompt; SPY-SMA/VIX regime read that deterministically halves
+  buy sizes in risk_off; volatility-normalized sizing; 30% sector cap;
+  $3-price/$5M-dollar-volume liquidity floor for buys.
+- **Nightly newsletter** (`src/newsletter.py`) -- HTML email (Gmail SMTP,
+  markdown fallback + vault copy): performance vs. SPY from daily
+  `equity_snapshots`, every trade with reasoning, lessons (new tonight +
+  standing), regime, scorecard, and ops metrics.
+- **Observability** -- `llm_calls` meters every Anthropic call (tokens +
+  cost, retries included); `context_snapshots` persists the exact
+  memory/market context injected per cycle ("what did the agent know when
+  it decided X" is a queryable fact); lesson citations in reasoning are
+  deterministically verified against the vault, with fabrications flagged
+  in `audit_log` and the newsletter.
+
+One-time setup for all of this: `SETUP-LEARNING.md`.
+
 ## Scheduling: 3x/day instead of continuous, with a redesigned universe
 
-`run_cycle()` is now meant to run on a fixed schedule (9:20am / 1:30pm /
-3:50pm ET, via `launchd` -- see `scripts/launchd/README.md` for setup)
-rather than continuously, and its default trading universe changed to
-match: instead of blindly scanning the full static S&P 500 (~500 symbols)
-every cycle, it's now built fresh each run from real current Alpaca
-positions (`get_all_positions()`, not the unsynced `holdings` table --
-see below) plus whatever tickers actually showed up in a broad news pull
-or in House PTR filings since the last cycle, ranked by mention count and
-capped at 50. `src/discovery.py` holds the pure, tested ranking/lookback-
+`run_cycle()` is now meant to run on a fixed schedule (10:00am / 12:45pm /
+3:30pm ET, via `launchd` -- see `scripts/launchd/README.md` for setup;
+re-timed 2026-07-16 from 9:20/1:30/3:50 -- the pre-open slot priced risk
+on thin pre-market quotes and filled in the opening auction) rather than
+continuously, and its default trading universe changed to match: instead
+of blindly scanning a static index list every cycle, it's built fresh
+each run from real current Alpaca positions (`get_all_positions()`, not
+the unsynced `holdings` table -- see below) plus whatever tickers
+actually showed up in a broad news pull or in House PTR filings since the
+last cycle, ranked by mention count and capped at 50. Discovery is
+filtered to every active, tradable, exchange-listed US equity (~4-5k
+names from Alpaca's asset master; OTC and units/warrants excluded --
+`fetch_tradable_universe` in `src/universe.py`), no longer the S&P 500
+alone; the bundled S&P CSV remains the fallback and the insider signal
+merges SEC's full ticker->CIK map once per cycle. `src/discovery.py` holds the pure, tested ranking/lookback-
 window logic; the network glue that feeds it lives next to each source's
 other wrappers in `news_sentiment.py` and `congressional.py`.
 
@@ -188,6 +267,14 @@ needed for this. Reload it any time to get fresh data.
   `scripts/debug_sentiment_truncation.py`, and
   `scripts/debug_senate_listing.py` (one-off diagnostics, kept around in
   case any of the underlying issues recur).
+- The full learning/observability layer (2026-07-16/17) -- see "The
+  learning system" above: `src/memory/{vault,recall,reflection}.py`,
+  `src/risk/{churn_guard,regime,sizing}.py`,
+  `src/signals/{fundamentals,weight_tuner}.py`, `src/newsletter.py`,
+  `src/nightly.py`, `src/llm_metering.py`, plus the `equity_snapshots`,
+  `llm_calls`, and `context_snapshots` tables and the nightly `launchd`
+  job (`scripts/launchd/com.ryan.autonomous-trader.nightly.plist`). All
+  pure logic fully tested -- the suite is at 429 tests.
 
 **Credentials:** `.env` has real Supabase, Anthropic, and Alpaca (paper)
 API-key values in place, and all three have been verified working from
@@ -217,28 +304,41 @@ your own machine.
 - This sandboxed development environment's network is allowlisted in a way
   that blocks direct calls to Supabase, Anthropic, and Alpaca -- so all
   live connectivity testing happens on your machine, not this one.
-- `run_cycle()`'s config values (risk weights, thresholds, safety limits)
-  live as hardcoded dataclass defaults, not yet wired up to read from the
-  `config` table in Supabase, even though that table exists and
-  `src/config.py`'s docstring describes it as the intended mechanism for
-  tuning these without redeploying.
+- `run_cycle()`'s RISK config values (risk weights, thresholds, safety
+  limits) live as hardcoded dataclass defaults, not yet wired up to read
+  from the `config` table in Supabase. (The signal BLEND weights are the
+  exception since 2026-07-16: `config.signal_blend_weights` is written by
+  the weekly retune and read by every cycle.)
+- **Planned next tiers** (deliberately waiting for enough history -- see
+  the timeline discussion in the vault/newsletter): a parameterized vault
+  query API behind an MCP server (hybrid push/pull memory once the vault
+  outgrows push-everything, ~2-3 months of history), and sampled
+  LLM-as-judge evals of context relevance/groundedness (worth starting
+  once the first lessons exist, ~2-3 weeks; aggregates meaningful at ~1
+  month).
 
 ## Setup
 
 ```bash
 cp .env.example .env
 # fill in SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY
+# optional (newsletter email): GMAIL_ADDRESS, GMAIL_APP_PASSWORD
 pip install -e ".[dev]"
 pytest
 ```
 
+Then `SETUP-LEARNING.md` for the learning-system one-time setup (yfinance,
+Gmail app password, the nightly `launchd` job, opening `vault/` in
+Obsidian).
+
 ## Architecture
 
-See the build plan doc for the full signal -> portfolio manager -> risk
-scorer -> execution/approval -> audit log pipeline. In short: nothing places
-an order without passing through both the risk scorer (decides if it needs
-human approval) and the safety rails (a stricter, non-negotiable layer
-checked before every single order regardless of approval status).
+Signals -> recall (memory + market context) -> LLM portfolio manager ->
+churn guard -> sizing (regime + volatility) -> sector cap + liquidity
+floor -> risk scorer -> execution + safety rails -> audit log, with the
+vault/reflection loop feeding memory back in nightly. Nothing places an
+order without passing every deterministic gate; nothing at all happens
+without an `audit_log` row.
 
 ## Risk scoring
 
@@ -247,22 +347,25 @@ composite_risk_score =
     0.5 * size_component        (trade_value / portfolio_value)
   + 0.3 * volatility_component  (asset_30d_vol / benchmark_30d_vol, capped)
   + 0.2 * liquidity_component   (liquidity penalty)
-
-needs_approval = composite_risk_score >= 70  OR  position_pct > 5%  (hard override)
 ```
 
-Weights, threshold, and the hard-override percentage are all configurable
-in `RiskScorerConfig` (`src/risk/scorer.py`) and intended to be tuned after
-backtesting.
+**Full autonomy (2026-07-16):** the score, the 70-point threshold
+comparison, and the >5% hard override are still computed and persisted on
+every trade as telemetry, but they no longer route anything to the human
+approval queue -- `RiskScorerConfig.require_human_approval` defaults to
+`False`. Set it `True` to restore the pre-autonomy human-in-the-loop
+behavior (`scripts/review_approvals.py` still works). Weights and
+thresholds remain configurable in `RiskScorerConfig`
+(`src/risk/scorer.py`).
 
 ## Safety rails (non-negotiable)
 
 Checked before every order, independent of risk-score approval status:
 - Kill switch (single flag, refuses all orders when engaged)
-- Max position size per trade (default **15%** of portfolio -- deliberately
-  higher than the risk scorer's 5% approval trigger above, so there's a
-  real band where a human's approval can actually result in a trade; see
-  "Status" above for the real bug this fixes)
+- Max position size per trade (default **15%** of portfolio -- originally
+  set above the risk scorer's 5% approval trigger so approvals had a real
+  band to act in, see "Status" above for the bug that motivated it; under
+  full autonomy it stands on its own as the absolute per-trade ceiling)
 - Max daily loss (default 3%) -- auto-halts for the rest of the day
 - Max weekly loss (default 8%) -- halts until manually reset
 
