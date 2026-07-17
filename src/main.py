@@ -689,6 +689,32 @@ def run_cycle(
             metadata={"blended_scores": blended_scores},
         )
         print("Cycle complete: portfolio manager proposed no trades this cycle")
+
+        # A deliberate no is a decision, and the vault records decisions --
+        # found the hard way (2026-07-17): the first cycle to run with
+        # memory injected chose restraint on all 59 symbols, and this early
+        # return skipped the journal write at the bottom of the function
+        # entirely, leaving the day's most interesting decision visible in
+        # audit_log but absent from the journal. Best-effort, same as the
+        # end-of-cycle journal write below.
+        try:
+            top_scores = sorted(blended_scores.items(), key=lambda kv: abs(kv[1]), reverse=True)[:5]
+            scores_text = ", ".join(f"{s} {v:+.1f}" for s, v in top_scores)
+            append_journal_entry(
+                vault,
+                today,
+                f"Cycle at {now_eastern_naive.strftime('%H:%M')} ET",
+                (
+                    f"Universe: {len(universe)} symbol(s), {len(blended_scores)} with usable signals. "
+                    f"Regime: {regime.label if regime else 'unavailable'}. "
+                    f"**No trades proposed** -- the portfolio manager reviewed the signals plus its memory "
+                    f"(recent actions, theses, lessons) and chose restraint. "
+                    f"Strongest signals passed over: {scores_text}."
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"vault journal write failed (non-blocking): {exc}")
+
         from src.notify import send_macos_notification
 
         send_macos_notification(
