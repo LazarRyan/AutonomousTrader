@@ -23,11 +23,22 @@ def test_low_risk_trade_is_auto_eligible():
     assert result.composite_score < 70
 
 
-def test_hard_override_above_5pct_position_forces_approval_even_if_score_low():
-    # 6% of portfolio, but otherwise totally benign (low vol, no liquidity penalty)
-    result = score_trade(make_inputs(trade_value=6_000.0))
+def test_hard_override_above_5pct_position_forces_approval_when_human_gate_enabled():
+    # 6% of portfolio, but otherwise totally benign (low vol, no liquidity penalty).
+    # require_human_approval=True restores the pre-full-autonomy behavior.
+    result = score_trade(make_inputs(trade_value=6_000.0), config=RiskScorerConfig(require_human_approval=True))
     assert result.hard_override_triggered is True
     assert result.needs_approval is True
+
+
+def test_full_autonomy_default_never_queues_but_keeps_telemetry():
+    # Full-autonomy update (2026-07-16): the same 6% trade still records the
+    # hard-override telemetry but no longer waits for a human.
+    result = score_trade(make_inputs(trade_value=6_000.0))
+    assert result.hard_override_triggered is True
+    assert result.needs_approval is False
+    assert "full-autonomy mode" in result.reasoning
+    assert "hard override" in result.reasoning
 
 
 def test_composite_score_above_threshold_forces_approval_even_under_5pct():
@@ -43,7 +54,7 @@ def test_composite_score_above_threshold_forces_approval_even_under_5pct():
     # only independently meaningful at a lower value, or with reweighted
     # inputs. Flagging here rather than silently asserting around it -- worth
     # revisiting once real backtested data informs the weights/threshold.
-    config = RiskScorerConfig(approval_threshold=45.0)
+    config = RiskScorerConfig(approval_threshold=45.0, require_human_approval=True)
     result = score_trade(
         make_inputs(
             trade_value=1_000.0,

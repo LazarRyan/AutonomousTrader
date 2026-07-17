@@ -84,6 +84,29 @@ class BlendConfig:
         if abs(total - 1.0) > 1e-9:
             raise ValueError(f"Blend weights must sum to 1.0, got {total}")
 
+    @classmethod
+    def from_weights(cls, weights: dict[str, float] | None) -> "BlendConfig":
+        """Build a BlendConfig from the adaptively-tuned weights stored in
+        the config table's signal_blend_weights column (written weekly by
+        src/signals/weight_tuner.py). None or an empty/partial dict falls
+        back to the equal-weight defaults -- a missing column value (e.g.
+        before the first weekly retune has ever run) must mean "the old
+        behavior", never a crash. A dict with unexpected keys or weights
+        that don't sum to 1.0 raises via __post_init__, same validation as
+        constructing directly -- a malformed persisted value is a real bug
+        to surface, not something to silently paper over."""
+        if not weights:
+            return cls()
+        expected = {"momentum", "insider", "congressional", "news_sentiment"}
+        if set(weights) != expected:
+            raise ValueError(f"signal_blend_weights keys must be exactly {sorted(expected)}, got {sorted(weights)}")
+        return cls(
+            momentum_weight=float(weights["momentum"]),
+            insider_weight=float(weights["insider"]),
+            congressional_weight=float(weights["congressional"]),
+            news_sentiment_weight=float(weights["news_sentiment"]),
+        )
+
 
 @dataclass(frozen=True)
 class SignalSnapshot:
@@ -150,6 +173,24 @@ _SYSTEM_PROMPT = """You are a portfolio manager agent for an automated paper-tra
 You are given a blended signal score (-100 to +100, positive = bullish) for each symbol under
 consideration, and the current portfolio context (total value, cash available, existing holdings).
 
+You may also be given MEMORY: your own recent actions, the standing thesis for each open position,
+lessons distilled from your past realized wins and losses, and a scorecard of how predictive each
+signal source has actually been. Treat memory as first-class input:
+- Do NOT re-propose a trade you already made recently just because the same signal is still strong.
+  A repeat add to an existing position requires genuinely NEW information (a materially changed
+  signal, a new filing or news event, or a changed thesis) -- the same information re-observed on a
+  later day is not new. If nothing has changed, propose nothing for that symbol.
+- Respect and apply the lessons: if a lesson says a pattern has repeatedly lost money, do not repeat
+  the pattern, and cite the lesson in your reasoning when it changes your decision.
+- Use the scorecard: a bullish score driven mainly by a source with a poor recent record deserves
+  less conviction than the same number driven by a source that has been predictive.
+- Propose an exit when a position's thesis is invalidated, even if the blended score is only mildly
+  negative -- thesis discipline beats score-chasing.
+You may also be given per-symbol fundamentals (sector, P/E, next earnings date) and a market regime
+assessment. Factor them in: avoid initiating new positions within 2 trading days before an earnings
+report unless your reasoning explicitly justifies holding through the print, and size/propose more
+conservatively in a risk-off regime.
+
 Propose zero or more candidate trades. You are NOT responsible for risk approval or position-size
 limits -- a separate deterministic system enforces those after you propose. However, use reasonable
 judgment: don't propose spending more cash than is available, don't propose selling more shares of a
@@ -171,10 +212,22 @@ if no trades are warranted):
 
 
 def build_portfolio_manager_prompt(
-    blended_scores: dict[str, float], portfolio: PortfolioContext
+    blended_scores: dict[str, float],
+    portfolio: PortfolioContext,
+    memory_context: str | None = None,
+    market_context: str | None = None,
 ) -> str:
     """Deterministic user-message construction. Pure function -- fully
-    unit-tested, no network/model call."""
+    unit-tested, no network/model call.
+
+    memory_context is the recall block built by
+    src.memory.recall.gather_memory_context (recent own actions, position
+    theses, lessons, signal scorecard); market_context is the
+    fundamentals/regime block built by src.signals.fundamentals. Both are
+    optional and default to None (omitted entirely from the prompt) so
+    existing callers/tests, and any cycle where memory gathering failed,
+    degrade cleanly to the original stateless prompt rather than injecting
+    an empty-but-present section the model might over-read into."""
     if not blended_scores:
         raise ValueError("build_portfolio_manager_prompt requires at least one blended score")
 
@@ -190,13 +243,18 @@ def build_portfolio_manager_prompt(
     else:
         holdings_lines = "  (no current holdings)"
 
-    return (
+    prompt = (
         f"Blended signal scores:\n{scores_lines}\n\n"
         f"Portfolio context:\n"
         f"  Total portfolio value: ${portfolio.total_portfolio_value:,.2f}\n"
         f"  Cash available: ${portfolio.cash_available:,.2f}\n"
         f"Current holdings:\n{holdings_lines}"
     )
+    if market_context:
+        prompt += f"\n\n{market_context.rstrip()}"
+    if memory_context:
+        prompt += f"\n\n{memory_context.rstrip()}"
+    return prompt
 
 
 def parse_portfolio_manager_response(response_text: str) -> list[CandidateTradeProposal]:
@@ -317,13 +375,23 @@ def propose_candidate_trades(
     anthropic_api_key: str,
     model: str = "claude-sonnet-5",
     max_attempts: int = 2,
+    memory_context: str | None = None,
+    market_context: str | None = None,
+    record_llm_call=None,
 ) -> list[CandidateTradeProposal]:
     """End-to-end: build the prompt, call the Anthropic API, parse the
-    reply. Thin glue around the tested pure functions above."""
+    reply. Thin glue around the tested pure functions above.
+
+    record_llm_call, if given, is called with (model, response.usage) after
+    EVERY attempt (retries cost real money too) -- run_cycle wires in
+    src.llm_metering.make_recorder's closure; the default None keeps this
+    module Supabase-free, same DI pattern as everything else."""
     import anthropic
 
     client = anthropic.Anthropic(api_key=anthropic_api_key)
-    user_prompt = build_portfolio_manager_prompt(blended_scores, portfolio)
+    user_prompt = build_portfolio_manager_prompt(
+        blended_scores, portfolio, memory_context=memory_context, market_context=market_context
+    )
 
     # thinking disabled outright -- see the identical, root-caused fix and
     # full explanation in news_sentiment.py's score_news_sentiment. Claude
@@ -357,6 +425,8 @@ def propose_candidate_trades(
             thinking={"type": "disabled"},
             messages=[{"role": "user", "content": user_prompt}],
         )
+        if record_llm_call is not None:
+            record_llm_call(model, response.usage)
         response_text = _extract_response_text(response)
         try:
             return parse_portfolio_manager_response(response_text)

@@ -153,3 +153,46 @@ alter table candidate_trades enable row level security;
 alter table executed_trades enable row level security;
 alter table approval_queue enable row level security;
 alter table audit_log enable row level security;
+
+-- ============================================================
+-- 2026-07-16: adaptive weights + equity snapshots (applied to the live
+-- project as migration adaptive_weights_and_equity_snapshots)
+-- ============================================================
+
+-- Adaptive signal blend weights (written weekly by src/signals/weight_tuner.py,
+-- read by every run_cycle via BlendConfig.from_weights). NULL = equal-weight defaults.
+alter table config add column if not exists signal_blend_weights jsonb;
+
+-- Daily equity snapshots for the newsletter's performance-vs-SPY curve
+-- (written by src/nightly.py once per trading day).
+create table if not exists equity_snapshots (
+    id uuid primary key default gen_random_uuid(),
+    snapshot_date date not null unique,
+    equity numeric not null,
+    cash numeric not null,
+    spy_close numeric,
+    created_at timestamptz not null default now()
+);
+
+alter table equity_snapshots enable row level security;
+
+-- ============================================================
+-- 2026-07-16: LLM cost telemetry (applied to the live project as
+-- migration llm_calls_telemetry). One row per Anthropic API call --
+-- see src/llm_metering.py.
+-- ============================================================
+create table if not exists llm_calls (
+    id uuid primary key default gen_random_uuid(),
+    call_type text not null check (call_type in ('portfolio_manager', 'news_sentiment', 'reflection')),
+    model text not null,
+    symbol text,
+    input_tokens integer not null,
+    output_tokens integer not null,
+    cost_usd numeric not null,
+    rates_known boolean not null default true,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists idx_llm_calls_created_at on llm_calls (created_at desc);
+
+alter table llm_calls enable row level security;

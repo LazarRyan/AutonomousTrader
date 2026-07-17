@@ -1,5 +1,5 @@
 #!/bin/bash
-# Wrapper invoked by launchd at 9:20am / 1:30pm / 3:50pm ET on weekdays
+# Wrapper invoked by launchd at 10:00am / 12:45pm / 3:30pm ET on weekdays
 # (see com.ryan.autonomous-trader.run-cycle.plist in this directory).
 #
 # launchd does NOT inherit your interactive shell's PATH or conda setup, so

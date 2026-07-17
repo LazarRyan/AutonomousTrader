@@ -1,4 +1,4 @@
-# launchd schedule: 9:20am / 1:30pm / 3:50pm ET
+# launchd schedule: 10:00am / 12:45pm / 3:30pm ET
 
 Runs `python -m src.main` (the real scheduled entry point -- places real
 paper trades, same as everything else in this project) three times a day
@@ -6,17 +6,15 @@ instead of continuously. Weekends, holidays, and early closes are handled
 by `run_cycle()`'s own market-day check (added specifically for this),
 not by launchd -- see `src/main.py`'s docstring.
 
-The 9:20am slot fires 10 minutes before the 9:30am open on purpose, so
-signals/proposals are ready and any resulting order is already queued with
-Alpaca in time for the opening cross. Two things worth knowing about that
-slot specifically: (1) a regular DAY market order (no `extended_hours` flag
-set -- see `place_alpaca_order` in `src/agents/execution.py`) submitted
-before the open is accepted and queued for the opening auction rather than
-rejected, so this works as intended; (2) the price used for risk-scoring at
-9:20am comes from Alpaca's IEX quote feed, and IEX itself doesn't trade
-pre-market -- so that "proposed_price" may just be the prior close's
-quote, not genuine live pre-market price discovery, and the actual fill at
-the open can differ from it.
+Re-timed 2026-07-16 (was 9:20am / 1:30pm / 3:50pm). The old 9:20am slot
+fired pre-open so orders queued for the opening cross -- which meant risk
+scoring ran on thin pre-market IEX quotes while fills happened in the
+opening auction, the widest-spread window of the day. The current slots
+trade against live, settled quotes instead: 10:00am (post-open, overnight
+news and filings digested), 12:45pm (midday news check), 3:30pm (full-day
+picture, with room for fills before the closing auction). If you change
+these, also update src/discovery.py's DailySchedule.slot_times -- it
+drives the news-lookback windows and must match this plist.
 
 ## One-time setup
 

@@ -89,6 +89,62 @@ def compute_liquidity_penalty(
     return max(0.0, min(100.0, penalty))
 
 
+@dataclass(frozen=True)
+class LiquidityFloorConfig:
+    """The hard data-quality floor for the full-market universe (2026-07-16,
+    added alongside the everything-tradable expansion in src/universe.py).
+    Distinct in kind from compute_liquidity_penalty above: the penalty is a
+    graded risk INPUT for scoring, this is a binary eligibility test --
+    below the floor, price/volume data is too degenerate for any of this
+    pipeline's signals to mean anything (spreads swamp momentum, one trade
+    moves 'sentiment'), so the trade is skipped outright rather than merely
+    scored as risky."""
+
+    min_price: float = 3.0
+    min_avg_dollar_volume: float = 5_000_000.0
+
+    def __post_init__(self) -> None:
+        if self.min_price <= 0:
+            raise ValueError("min_price must be > 0")
+        if self.min_avg_dollar_volume <= 0:
+            raise ValueError("min_avg_dollar_volume must be > 0")
+
+
+def passes_liquidity_floor(
+    closes: list[float], volumes: list[float], config: LiquidityFloorConfig | None = None
+) -> tuple[bool, str]:
+    """(passes, reason) for the hard floor above. Same input validation
+    posture as compute_liquidity_penalty: mismatched/empty/invalid series
+    raise rather than guess. Pure, unit-tested."""
+    config = config or LiquidityFloorConfig()
+
+    if len(closes) != len(volumes):
+        raise ValueError(f"closes and volumes must be the same length, got {len(closes)} and {len(volumes)}")
+    if not closes:
+        raise ValueError("closes/volumes must not be empty")
+    if any(c <= 0 for c in closes):
+        raise ValueError("All closes must be > 0")
+    if any(v < 0 for v in volumes):
+        raise ValueError("All volumes must be >= 0")
+
+    latest_price = closes[-1]
+    avg_dollar_volume = statistics.mean(c * v for c, v in zip(closes, volumes))
+
+    if latest_price < config.min_price:
+        return False, (
+            f"price ${latest_price:.2f} is below the ${config.min_price:.2f} floor -- "
+            f"sub-${config.min_price:.0f} names have spread/data quality this pipeline can't price honestly"
+        )
+    if avg_dollar_volume < config.min_avg_dollar_volume:
+        return False, (
+            f"avg daily dollar volume ${avg_dollar_volume:,.0f} is below the "
+            f"${config.min_avg_dollar_volume:,.0f} floor -- too thin to trade on these signals"
+        )
+    return True, (
+        f"price ${latest_price:.2f} and avg daily dollar volume ${avg_dollar_volume:,.0f} clear the floor"
+    )
+
+
 # ============================================================
 # Network wrapper -- not unit-tested here (requires live Alpaca network +
 # keys). See signals/momentum.py's fetch_daily_closes for the same pattern.

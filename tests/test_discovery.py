@@ -46,21 +46,21 @@ class TestComputeLookbackStart:
 
     def test_first_slot_of_day_looks_back_to_previous_session_close(self):
         previous_close = datetime(2026, 7, 2, 16, 0, tzinfo=self.ET)  # previous Thursday close
-        now = self._dt(9, 21)  # just after the 9:20 slot fires
+        now = self._dt(10, 1)  # just after the 10:00am slot fires
         result = compute_lookback_start(now, previous_close)
         assert result == previous_close
 
     def test_second_slot_looks_back_to_first_slot_same_day(self):
         previous_close = datetime(2026, 7, 6, 9, 30, tzinfo=self.ET)  # today's open, irrelevant here
-        now = self._dt(13, 31)  # just after the 1:30pm slot fires
+        now = self._dt(12, 46)  # just after the 12:45pm slot fires
         result = compute_lookback_start(now, previous_close)
-        assert result == self._dt(9, 20)
+        assert result == self._dt(10, 0)
 
     def test_third_slot_looks_back_to_second_slot_same_day(self):
         previous_close = self._dt(9, 30)
-        now = self._dt(15, 51)  # just after the 3:50pm slot fires
+        now = self._dt(15, 31)  # just after the 3:30pm slot fires
         result = compute_lookback_start(now, previous_close)
-        assert result == self._dt(13, 30)
+        assert result == self._dt(12, 45)
 
     def test_invoked_before_any_scheduled_slot_looks_back_to_previous_close(self):
         # e.g. a manual ad-hoc dry run at 8am, before the first real slot.

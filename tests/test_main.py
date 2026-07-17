@@ -113,7 +113,7 @@ class TestProcessCandidateTrade:
             insert_approval_queue_item=deps.insert_approval_queue_item,
             execute_trade_fn=deps.execute_trade_fn,
             log_audit=deps.log_audit,
-            risk_config=RiskScorerConfig(approval_threshold=40.0),
+            risk_config=RiskScorerConfig(approval_threshold=40.0, require_human_approval=True),
         )
         assert outcome == "queued_for_approval"
         assert len(deps.approval_queue_inserts) == 1
@@ -121,7 +121,9 @@ class TestProcessCandidateTrade:
 
     def test_hard_override_position_size_queues_even_with_benign_inputs(self):
         deps = FakeCycleDeps()
-        # 6% of portfolio -- hard override regardless of otherwise-clean signal
+        # 6% of portfolio -- hard override regardless of otherwise-clean
+        # signal (with the human gate explicitly re-enabled; the default is
+        # full autonomy as of 2026-07-16 -- see the autonomy test below).
         outcome = process_candidate_trade(
             make_proposal(quantity=60.0),
             proposed_price=100.0,  # $6,000 / $100,000 = 6%
@@ -133,9 +135,34 @@ class TestProcessCandidateTrade:
             insert_approval_queue_item=deps.insert_approval_queue_item,
             execute_trade_fn=deps.execute_trade_fn,
             log_audit=deps.log_audit,
+            risk_config=RiskScorerConfig(require_human_approval=True),
         )
         assert outcome == "queued_for_approval"
         assert deps.execute_trade_calls == []
+
+    def test_full_autonomy_default_executes_hard_override_trade_without_queueing(self):
+        # Full-autonomy update (2026-07-16): the same 6% trade with the
+        # DEFAULT config goes straight to execution -- nothing waits for a
+        # human -- while the would-have-queued telemetry stays in the audit
+        # reasoning. Safety rails (15% cap, no-margin, halts) still apply
+        # inside the execution agent, tested in test_safety_rails.py.
+        deps = FakeCycleDeps()
+        outcome = process_candidate_trade(
+            make_proposal(quantity=60.0),
+            proposed_price=100.0,
+            total_portfolio_value=100_000.0,
+            asset_30d_volatility=0.01,
+            benchmark_30d_volatility=0.01,
+            liquidity_penalty=0.0,
+            insert_candidate_trade=deps.insert_candidate_trade,
+            insert_approval_queue_item=deps.insert_approval_queue_item,
+            execute_trade_fn=deps.execute_trade_fn,
+            log_audit=deps.log_audit,
+        )
+        assert outcome == "executed"
+        assert deps.approval_queue_inserts == []
+        assert len(deps.execute_trade_calls) == 1
+        assert "full-autonomy mode" in deps.log_audit_calls[0]["reasoning"]
 
     def test_candidate_trade_is_always_persisted_regardless_of_outcome(self):
         deps_auto = FakeCycleDeps()
@@ -196,7 +223,7 @@ class TestProcessCandidateTrade:
             insert_approval_queue_item=deps_queued.insert_approval_queue_item,
             execute_trade_fn=deps_queued.execute_trade_fn,
             log_audit=deps_queued.log_audit,
-            risk_config=RiskScorerConfig(approval_threshold=40.0),
+            risk_config=RiskScorerConfig(approval_threshold=40.0, require_human_approval=True),
         )
         assert deps_queued.log_audit_calls[0]["decision"] == "queued_for_approval"
 
@@ -235,7 +262,7 @@ class TestNotifyApprovalNeeded:
             insert_approval_queue_item=deps.insert_approval_queue_item,
             execute_trade_fn=deps.execute_trade_fn,
             log_audit=deps.log_audit,
-            risk_config=RiskScorerConfig(approval_threshold=40.0),
+            risk_config=RiskScorerConfig(approval_threshold=40.0, require_human_approval=True),
             notify_approval_needed=lambda p, r: notify_calls.append((p, r)),
         )
         assert len(notify_calls) == 1
@@ -276,7 +303,7 @@ class TestNotifyApprovalNeeded:
             insert_approval_queue_item=deps.insert_approval_queue_item,
             execute_trade_fn=deps.execute_trade_fn,
             log_audit=deps.log_audit,
-            risk_config=RiskScorerConfig(approval_threshold=40.0),
+            risk_config=RiskScorerConfig(approval_threshold=40.0, require_human_approval=True),
         )
         assert outcome == "queued_for_approval"
 

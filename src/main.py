@@ -1,6 +1,6 @@
 """
-Entry point -- the scheduled run loop, now scheduled 3x/day (9:20am/1:30pm/
-3:50pm ET via launchd -- see scripts/launchd/) rather than continuously,
+Entry point -- the scheduled run loop, now scheduled 3x/day (10:00am/12:45pm/
+3:30pm ET via launchd -- see scripts/launchd/) rather than continuously,
 that ties everything else together:
 
   1. Load config + safety_state from Supabase.
@@ -306,7 +306,14 @@ def gather_signal_snapshot(
         else:
             headlines = news_sentiment.fetch_recent_news(symbol, settings.alpaca_api_key, settings.alpaca_secret_key)
         if headlines:
-            news_result = news_sentiment.score_news_sentiment(symbol, headlines, settings.anthropic_api_key)
+            record_llm_call = None
+            if supabase_client is not None:
+                from src.llm_metering import make_recorder
+
+                record_llm_call = make_recorder(supabase_client, "news_sentiment")
+            news_result = news_sentiment.score_news_sentiment(
+                symbol, headlines, settings.anthropic_api_key, record_llm_call=record_llm_call
+            )
             news_score = news_result.score
             _persist("news_sentiment", news_score, news_result)
     except Exception as exc:  # noqa: BLE001
@@ -354,8 +361,8 @@ def run_cycle(
     (is_trading_halted, process_candidate_trade) are tested in isolation;
     this function is glue.
 
-    UNIVERSE, redesigned for the 3x/day launchd schedule (9:20am/1:30pm/
-    3:50pm ET -- see scripts/launchd/): when `universe` isn't passed in
+    UNIVERSE, redesigned for the 3x/day launchd schedule (10:00am/12:45pm/
+    3:30pm ET -- see scripts/launchd/): when `universe` isn't passed in
     explicitly, it's no longer the full static S&P 500 list scanned blindly
     every cycle. It's built fresh each run from three sources, unioned
     together:
@@ -394,10 +401,35 @@ def run_cycle(
     from src.db import write_audit_log
     from src.discovery import compute_lookback_start, rank_discovered_symbols
     from src.signals import congressional, news_sentiment
-    from src.universe import load_sp500_cik_map, load_sp500_universe
+    from src.universe import fetch_tradable_universe, load_sp500_cik_map, load_sp500_universe
 
+    # Full-market universe (2026-07-16): discovery is no longer filtered to
+    # the S&P 500 -- any active, tradable, exchange-listed US equity is
+    # eligible when it shows up in news or congressional filings. The
+    # bundled S&P list remains the fallback when the Alpaca asset-master
+    # fetch fails: loudly degraded beats silently tiny.
+    try:
+        valid_universe_set = fetch_tradable_universe(alpaca_trading_client)
+        print(f"discovery universe: {len(valid_universe_set)} tradable exchange-listed symbols")
+    except Exception as exc:  # noqa: BLE001
+        valid_universe_set = set(load_sp500_universe())
+        print(f"tradable-universe fetch failed, falling back to bundled S&P 500 list: {exc}")
+
+    # CIK map for the insider signal: the bundled S&P CSV covers only 500
+    # names, so with the full-market universe the complete SEC ticker->CIK
+    # file is fetched ONCE per cycle and merged over it (best-effort -- the
+    # insider signal simply has no CIK, and therefore no score, for symbols
+    # missing from whatever map we end up with; every other signal still
+    # works). Without this merge, gather_signal_snapshot's per-symbol
+    # fallback would re-download the same SEC file for every non-S&P symbol
+    # in the cycle.
     cik_map = load_sp500_cik_map()
-    sp500_universe_set = set(load_sp500_universe())
+    try:
+        from src.signals.insider_edgar import fetch_ticker_cik_map
+
+        cik_map = {**fetch_ticker_cik_map(sec_user_agent), **cik_map}
+    except Exception as exc:  # noqa: BLE001
+        print(f"full SEC CIK map fetch failed, insider signal limited to bundled S&P names this cycle: {exc}")
 
     def log_audit(event_type, decision, reasoning, symbol=None, candidate_trade_id=None, metadata=None):
         write_audit_log(
@@ -490,7 +522,7 @@ def run_cycle(
             )
             news_headlines_by_symbol = news_sentiment.bucket_headlines_by_symbol(news_articles)
             news_discovered = rank_discovered_symbols(
-                [article.symbols for article in news_articles], cap=discovery_cap, valid_universe=sp500_universe_set
+                [article.symbols for article in news_articles], cap=discovery_cap, valid_universe=valid_universe_set
             )
         except Exception as exc:  # noqa: BLE001 -- one discovery source must not take out the whole cycle
             print(f"broad news discovery pull failed, continuing without it: {exc}")
@@ -510,7 +542,7 @@ def run_cycle(
 
             congressional_transactions_by_ticker = congressional.aggregate_transactions_by_ticker(house_transactions)
             congressional_discovered = rank_discovered_symbols(
-                [[txn.ticker] for txn in house_transactions], cap=discovery_cap, valid_universe=sp500_universe_set
+                [[txn.ticker] for txn in house_transactions], cap=discovery_cap, valid_universe=valid_universe_set
             )
         except Exception as exc:  # noqa: BLE001
             print(f"congressional discovery pull failed, continuing without it: {exc}")
@@ -528,7 +560,42 @@ def run_cycle(
             metadata={"universe": universe},
         )
 
-    blend_config = BlendConfig()
+    # ---- Memory recall (best-effort): the agent's own recent actions,
+    # position theses, lessons, and signal scorecard, injected into the
+    # portfolio manager prompt so cycles stop being stateless (see
+    # src/memory/recall.py for the KHC repeat-buy incident that motivated
+    # this). recent_actions is fetched once and reused by the churn guard
+    # below. A memory failure degrades to the old stateless prompt -- it
+    # must never stop a trading cycle.
+    from src.memory.recall import RecentAction, build_memory_context, fetch_recent_actions
+    from src.memory.vault import Vault, append_journal_entry, append_position_history, read_lessons, read_position_thesis, read_scorecard
+
+    vault = Vault()
+    recent_actions: list[RecentAction] = []
+    memory_context: str | None = None
+    try:
+        recent_actions = fetch_recent_actions(supabase_client)
+        theses = {}
+        for held in sorted(held_symbols):
+            thesis = read_position_thesis(vault, held)
+            if thesis:
+                theses[held] = thesis
+        memory_context = build_memory_context(recent_actions, theses, read_lessons(vault), read_scorecard(vault))
+    except Exception as exc:  # noqa: BLE001 -- memory is an enhancement; stateless is the fallback, not a crash
+        print(f"memory recall failed, running this cycle stateless: {exc}")
+
+    # ---- Adaptive blend weights: written weekly by the nightly retune
+    # (src/signals/weight_tuner.py) into config.signal_blend_weights; a
+    # missing/never-tuned value falls back to the equal-weight defaults
+    # inside from_weights.
+    try:
+        from src.db import get_config
+
+        blend_config = BlendConfig.from_weights(get_config(supabase_client).get("signal_blend_weights"))
+    except Exception as exc:  # noqa: BLE001 -- a config-read hiccup shouldn't skip the cycle; defaults are safe
+        print(f"could not load adaptive blend weights, using equal-weight defaults: {exc}")
+        blend_config = BlendConfig()
+
     blended_scores: dict[str, float] = {}
     for symbol in universe:
         snapshot = gather_signal_snapshot(
@@ -550,10 +617,55 @@ def run_cycle(
         print("Cycle skipped: no signal data available")
         return
 
+    # ---- Market context (best-effort): fundamentals for the symbols most
+    # likely to be traded (held positions + strongest absolute scores,
+    # capped -- yfinance is slow and throttles, so no full-universe pull),
+    # plus a market regime read. Context for the prompt AND inputs to the
+    # deterministic sector/sizing gates below.
+    from src.signals.fundamentals import FundamentalsSnapshot
+
+    fundamentals_by_symbol: dict[str, FundamentalsSnapshot] = {}
+    regime = None
+    market_context: str | None = None
+    try:
+        from src.signals.fundamentals import fetch_fundamentals, render_market_context
+        from src.risk.regime import assess_market_regime, fetch_vix_level
+        from src.signals.momentum import fetch_daily_closes
+
+        top_scored = sorted(blended_scores, key=lambda s: abs(blended_scores[s]), reverse=True)[:15]
+        for symbol in sorted(held_symbols | set(top_scored)):
+            fundamentals_by_symbol[symbol.upper()] = fetch_fundamentals(symbol)
+
+        try:
+            spy_closes = fetch_daily_closes(BENCHMARK_SYMBOL, settings.alpaca_api_key, settings.alpaca_secret_key, lookback_days=120)
+            regime = assess_market_regime(spy_closes, fetch_vix_level())
+        except Exception as exc:  # noqa: BLE001 -- no regime read = no scaling, never a blocker
+            print(f"market regime assessment failed, continuing without it: {exc}")
+
+        market_context = render_market_context(list(fundamentals_by_symbol.values()), regime, today)
+    except Exception as exc:  # noqa: BLE001
+        print(f"market context gathering failed, continuing without it: {exc}")
+
+    # Current $ exposure per sector, for the concentration gate. Built from
+    # real Alpaca position market values + this cycle's fundamentals; a held
+    # symbol without a sector read simply doesn't contribute (the gate
+    # already treats unknown sectors permissively -- see src/risk/sizing.py).
+    sector_exposure_value: dict[str, float] = {}
+    for p in positions:
+        snapshot = fundamentals_by_symbol.get(p.symbol.upper())
+        market_value = getattr(p, "market_value", None)
+        if snapshot and snapshot.sector and market_value is not None:
+            sector_exposure_value[snapshot.sector] = sector_exposure_value.get(snapshot.sector, 0.0) + float(market_value)
+
+    from src.llm_metering import make_recorder
+
     proposals = propose_candidate_trades(
         blended_scores,
         PortfolioContext(total_portfolio_value=total_portfolio_value, cash_available=cash_available, holdings=holdings),
         settings.anthropic_api_key,
+        memory_context=memory_context,
+        market_context=market_context,
+        record_llm_call=make_recorder(supabase_client, "portfolio_manager"),
     )
 
     # "The portfolio manager looked at real signal data and decided nothing
@@ -692,7 +804,48 @@ def run_cycle(
     # they settle, so within a cycle this stays conservative.
     remaining_cash = cash_available
 
+    # ---- Anti-churn guard inputs: the guard is deterministic (see
+    # src/risk/churn_guard.py -- it ENFORCES what the memory prompt only
+    # asks for) and runs on the same recent_actions recall already fetched.
+    import dataclasses as _dataclasses
+    from datetime import datetime as _datetime, timezone as _timezone
+
+    from src.risk.churn_guard import PastExecution, evaluate_churn
+    from src.risk.sizing import (
+        evaluate_sector_concentration,
+        scale_buy_quantity_for_regime,
+        scale_buy_quantity_for_volatility,
+    )
+
+    past_executions = [
+        PastExecution(
+            symbol=action.symbol,
+            side=action.side,
+            status=action.status,
+            blended_signal_score=action.blended_signal_score,
+            executed_at=_datetime.fromisoformat(action.created_at.replace("Z", "+00:00")),
+        )
+        for action in recent_actions
+    ]
+    guard_now = _datetime.now(_timezone.utc)
+
     for proposal in proposals:
+        # ---- Churn gate first: cheapest check, and a suppressed repeat
+        # shouldn't cost quote/volatility API calls. A suppressed proposal
+        # is a real decision -> audit_log row, same as everything else.
+        churn = evaluate_churn(
+            proposal.symbol, proposal.side, blended_scores.get(proposal.symbol), past_executions, now=guard_now
+        )
+        if not churn.allowed:
+            log_audit(
+                event_type="churn_guard",
+                decision="churn_suppressed",
+                reasoning=churn.reason,
+                symbol=proposal.symbol,
+            )
+            print(f"[{proposal.symbol}] churn guard suppressed {proposal.side}: {churn.reason}")
+            continue
+
         try:
             quote_request = StockLatestQuoteRequest(symbol_or_symbols=proposal.symbol, feed=DataFeed.IEX)
             quote = market_data_client.get_stock_latest_quote(quote_request)[proposal.symbol]
@@ -724,6 +877,63 @@ def run_cycle(
             )
             continue
 
+        # ---- Hard liquidity floor (full-market universe, 2026-07-16):
+        # binary eligibility, distinct from the graded liquidity penalty
+        # fed to the scorer -- see LiquidityFloorConfig's docstring. Only
+        # gates BUYS: if a held position has decayed below the floor, the
+        # one thing we must never block is getting out of it.
+        if proposal.side == "buy":
+            from src.risk.market_data import passes_liquidity_floor
+
+            floor_ok, floor_reason = passes_liquidity_floor(asset_closes, asset_volumes)
+            if not floor_ok:
+                log_audit(
+                    event_type="liquidity_floor",
+                    decision="liquidity_floor_blocked",
+                    reasoning=floor_reason,
+                    symbol=proposal.symbol,
+                )
+                print(f"[{proposal.symbol}] liquidity floor blocked buy: {floor_reason}")
+                continue
+
+        # ---- Deterministic buy sizing: regime first, then volatility
+        # normalization (src/risk/sizing.py). Sells pass through untouched.
+        scaled_quantity = scale_buy_quantity_for_regime(proposal.quantity, proposal.side, regime)
+        scaled_quantity = scale_buy_quantity_for_volatility(
+            scaled_quantity, proposal.side, asset_30d_volatility, benchmark_30d_volatility
+        )
+        if scaled_quantity != proposal.quantity:
+            log_audit(
+                event_type="sizing",
+                decision="quantity_scaled",
+                reasoning=(
+                    f"buy quantity scaled {proposal.quantity:g} -> {scaled_quantity:g} "
+                    f"(regime: {regime.label if regime else 'unavailable'}, "
+                    f"vol ratio {asset_30d_volatility / benchmark_30d_volatility:.2f}x benchmark)"
+                ),
+                symbol=proposal.symbol,
+            )
+            proposal = _dataclasses.replace(proposal, quantity=scaled_quantity)
+
+        # ---- Sector concentration gate (buys only, see src/risk/sizing.py).
+        proposal_fundamentals = fundamentals_by_symbol.get(proposal.symbol.upper())
+        sector_decision = evaluate_sector_concentration(
+            side=proposal.side,
+            trade_value=proposal.quantity * proposed_price,
+            symbol_sector=proposal_fundamentals.sector if proposal_fundamentals else None,
+            sector_exposure_value=sector_exposure_value,
+            total_portfolio_value=total_portfolio_value,
+        )
+        if not sector_decision.allowed:
+            log_audit(
+                event_type="sector_cap",
+                decision="sector_cap_blocked",
+                reasoning=sector_decision.reason,
+                symbol=proposal.symbol,
+            )
+            print(f"[{proposal.symbol}] sector cap blocked buy: {sector_decision.reason}")
+            continue
+
         outcome = process_candidate_trade(
             proposal,
             proposed_price=proposed_price,
@@ -741,6 +951,54 @@ def run_cycle(
         cycle_outcomes.append(outcome)
         if outcome == "executed" and proposal.side == "buy":
             remaining_cash -= proposal.quantity * proposed_price
+            # Keep the sector ledger current within the cycle so several
+            # same-sector buys can't collectively bust the cap that each
+            # would individually have cleared (same running-total reasoning
+            # as remaining_cash above).
+            if proposal_fundamentals and proposal_fundamentals.sector:
+                sector_exposure_value[proposal_fundamentals.sector] = (
+                    sector_exposure_value.get(proposal_fundamentals.sector, 0.0)
+                    + proposal.quantity * proposed_price
+                )
+
+        # Vault position history for anything that actually changed the
+        # position -- this is what makes Positions/<SYM>.md a complete
+        # action log the nightly reflection builds theses on. Best-effort:
+        # a vault write failure must never affect trading.
+        if outcome == "executed":
+            try:
+                append_position_history(
+                    vault,
+                    proposal.symbol,
+                    f"{today.isoformat()}: {proposal.side.upper()} x{proposal.quantity:g} @ ~${proposed_price:.2f} "
+                    f"(signal {blended_scores.get(proposal.symbol, 0):+.1f}) -- {proposal.reasoning}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{proposal.symbol}] vault position-history write failed (non-blocking): {exc}")
+
+    # ---- Cycle journal entry (best-effort). One section per scheduled
+    # cycle in the day's note; the nightly reflection appends its own
+    # section to the same file after the close.
+    try:
+        from collections import Counter as _Counter
+
+        outcome_counts = dict(_Counter(cycle_outcomes))
+        append_journal_entry(
+            vault,
+            today,
+            f"Cycle at {now_eastern_naive.strftime('%H:%M')} ET",
+            (
+                f"Universe: {len(universe)} symbol(s), {len(blended_scores)} with usable signals. "
+                f"Regime: {regime.label if regime else 'unavailable'}. "
+                f"Proposals: {len(proposals)}; outcomes: {outcome_counts or 'none reached execution stage'}.\n\n"
+                + "\n".join(
+                    f"- {p.symbol} {p.side.upper()} x{p.quantity:g} (signal {blended_scores.get(p.symbol, 0):+.1f}) -- {p.reasoning}"
+                    for p in proposals
+                )
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"vault journal write failed (non-blocking): {exc}")
 
     _notify_cycle_summary(len(proposals), cycle_outcomes)
 

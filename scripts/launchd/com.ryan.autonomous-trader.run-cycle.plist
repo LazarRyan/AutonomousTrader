@@ -8,26 +8,34 @@
     <!-- Fires every day at these three times. Weekends, holidays, and
          early closes are handled by main.py's own market-day check (added
          specifically for this schedule), not here, so this doesn't need a
-         Weekday key duplicating that logic. -->
+         Weekday key duplicating that logic.
+
+         Re-timed 2026-07-16 (was 9:20/1:30/3:50): the 9:20 slot ran
+         PRE-open -- risk math on thin pre-market IEX quotes, fills in the
+         opening auction (the widest-spread window of the day); and 3:50
+         sat only 2h20m after 1:30, re-observing mostly-unchanged signals.
+         Now: 10:00 (post-open, spreads normalized, overnight news/filings
+         digested), 12:45 (midday news check), 3:30 (full-day picture with
+         room for fills before the closing auction). -->
     <key>StartCalendarInterval</key>
     <array>
         <dict>
             <key>Hour</key>
-            <integer>9</integer>
+            <integer>10</integer>
             <key>Minute</key>
-            <integer>20</integer>
+            <integer>0</integer>
         </dict>
         <dict>
             <key>Hour</key>
-            <integer>13</integer>
+            <integer>12</integer>
             <key>Minute</key>
-            <integer>30</integer>
+            <integer>45</integer>
         </dict>
         <dict>
             <key>Hour</key>
             <integer>15</integer>
             <key>Minute</key>
-            <integer>50</integer>
+            <integer>30</integer>
         </dict>
     </array>
 

@@ -38,6 +38,15 @@ class Settings:
     trading_mode: str  # "paper" (default/only supported for now) or "live"
     anthropic_api_key: str | None = None  # required for the LLM-based signal/agent, not for Phase 0 core
 
+    # Nightly newsletter email (src/nightly.py / src/newsletter.py). All
+    # optional: unset means the newsletter is written to the vault only,
+    # never that the nightly job fails. gmail_app_password is a Google App
+    # Password (https://myaccount.google.com/apppasswords), NOT the account
+    # password -- see .env.example.
+    gmail_address: str | None = None
+    gmail_app_password: str | None = None
+    newsletter_to: str | None = None
+
     @property
     def is_live_mode(self) -> bool:
         return self.trading_mode == "live"
@@ -67,4 +76,7 @@ def load_settings() -> Settings:
         alpaca_secret_key=required["ALPACA_SECRET_KEY"],
         trading_mode=trading_mode,
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+        gmail_address=os.getenv("GMAIL_ADDRESS"),
+        gmail_app_password=os.getenv("GMAIL_APP_PASSWORD"),
+        newsletter_to=os.getenv("NEWSLETTER_TO"),
     )

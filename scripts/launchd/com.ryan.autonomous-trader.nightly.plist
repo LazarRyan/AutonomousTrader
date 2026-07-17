@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ryan.autonomous-trader.nightly</string>
+
+    <!-- 5:30pm local, comfortably after the 4:00pm close (and after any
+         early close). Weekends/holidays are handled by nightly.py's own
+         trading-day check, same pattern as the run-cycle plist. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>17</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+    </array>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/ryanlazar/dev/AutonomousTrader/scripts/launchd/run_nightly.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/ryanlazar/dev/AutonomousTrader</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/ryanlazar/Library/Logs/autonomous-trader/nightly.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ryanlazar/Library/Logs/autonomous-trader/nightly.err.log</string>
+</dict>
+</plist>

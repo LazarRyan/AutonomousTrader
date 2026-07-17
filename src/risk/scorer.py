@@ -19,6 +19,12 @@ regardless of composite score.
 Threshold: needs_approval if composite_risk_score >= 70, OR the hard override
 above fires -- whichever triggers first.
 
+FULL-AUTONOMY UPDATE (2026-07-16): both of the above now only ROUTE to the
+approval queue when RiskScorerConfig.require_human_approval is True, and it
+defaults to False -- see that field's docstring. The score, override flag,
+and threshold comparison are still computed and persisted on every trade;
+they just no longer gate execution by default.
+
 Both the weights and the threshold are configurable (see RiskScorerConfig) so
 they can be tuned after backtesting without touching this logic.
 
@@ -43,7 +49,21 @@ class RiskScorerConfig:
     volatility_weight: float = 0.3
     liquidity_weight: float = 0.2
 
-    # Composite score at/above this value requires human approval.
+    # FULL AUTONOMY (2026-07-16, at Ryan's explicit request): when False
+    # (the new default), NOTHING is ever routed to the human approval
+    # queue -- the threshold/override below are still computed and recorded
+    # in every candidate_trades row and reasoning string (the telemetry of
+    # "this would previously have needed sign-off" is worth keeping), but
+    # needs_approval is always False. The deterministic safety rails
+    # (risk/safety_rails.py: 15% max position, no-margin, loss halts) and
+    # the other autonomous gates (churn guard, sector cap, liquidity
+    # floor) are NOT affected -- those act on their own without asking a
+    # human, which is exactly what full autonomy means here. Set True to
+    # restore the pre-2026-07-16 human-in-the-loop behavior.
+    require_human_approval: bool = False
+
+    # Composite score at/above this value requires human approval (only
+    # when require_human_approval is True).
     approval_threshold: float = 70.0
 
     # Any single trade above this fraction of portfolio value ALWAYS requires
@@ -128,7 +148,8 @@ def score_trade(inputs: TradeRiskInputs, config: RiskScorerConfig | None = None)
     )
 
     hard_override_triggered = position_pct > config.hard_override_position_pct
-    needs_approval = hard_override_triggered or composite_score >= config.approval_threshold
+    would_need_approval = hard_override_triggered or composite_score >= config.approval_threshold
+    needs_approval = config.require_human_approval and would_need_approval
 
     reasons = []
     if hard_override_triggered:
@@ -147,6 +168,10 @@ def score_trade(inputs: TradeRiskInputs, config: RiskScorerConfig | None = None)
             f"{config.approval_threshold:.1f} and position size "
             f"{position_pct:.2%} within limit -- eligible for auto-execution"
         )
+    elif not config.require_human_approval:
+        # The would-have-queued telemetry stays in the record even though
+        # nothing queues anymore -- see require_human_approval's docstring.
+        reasons.append("full-autonomy mode: auto-executing without human approval (safety rails still apply)")
     reasoning = "; ".join(reasons)
 
     return RiskScoreResult(

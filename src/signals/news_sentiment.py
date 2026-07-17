@@ -253,9 +253,15 @@ def score_news_sentiment(
     anthropic_api_key: str,
     model: str = "claude-sonnet-5",
     max_attempts: int = 2,
+    record_llm_call=None,
 ) -> NewsSentimentResult:
     """End-to-end: build the prompt, call the Anthropic API, parse the
     reply. Thin glue around the tested pure functions above.
+
+    record_llm_call, if given, is called with (model, response.usage,
+    symbol) after every attempt -- cost telemetry via
+    src.llm_metering.make_recorder, wired in by gather_signal_snapshot.
+    Default None keeps this module Supabase-free.
     """
     import anthropic
 
@@ -296,6 +302,8 @@ def score_news_sentiment(
             thinking={"type": "disabled"},
             messages=[{"role": "user", "content": user_prompt}],
         )
+        if record_llm_call is not None:
+            record_llm_call(model, response.usage, symbol)
         response_text = _extract_response_text(response)
         try:
             parsed = parse_sentiment_response(response_text)
