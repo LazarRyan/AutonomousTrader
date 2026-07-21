@@ -355,6 +355,7 @@ def run_cycle(
     sec_user_agent: str,
     universe: list[str] | None = None,
     discovery_cap: int = 50,
+    congressional_discovery_cap: int = 15,
 ) -> None:
     """The actual scheduled entry point. Not unit-tested -- real network
     calls throughout. The pieces that matter for correctness
@@ -375,9 +376,15 @@ def run_cycle(
          at `discovery_cap`, filtered to the known S&P 500 list (screens
          out OTC/junk tickers the rest of the pipeline -- insider EDGAR's
          CIK map in particular -- isn't built to handle).
-      3. Tickers mentioned in House PTR filings filed since the last cycle,
-         same ranking/cap/filter. (Senate discovery isn't wired in yet --
-         see scripts/debug_senate_listing.py for why.)
+      3. Tickers mentioned in House PTR filings filed in the last
+         congressional.HOUSE_PTR_LOOKBACK_DAYS days (30 -- deliberately NOT
+         "since the last cycle" like news; PTRs lag trades by weeks and only
+         a handful are filed per day, so the shared hours-long window found
+         ~zero filings per cycle and the signal never accumulated scorecard
+         samples). Same ranking/filter, but capped at the smaller
+         `congressional_discovery_cap` to bound per-symbol API/LLM cost.
+         (Senate discovery isn't wired in yet -- see
+         scripts/debug_senate_listing.py for why.)
 
     An explicit `universe` argument (e.g. scripts/dry_run.py's small manual
     lists) bypasses all of this and is used as-is, same as before -- the
@@ -538,20 +545,46 @@ def run_cycle(
 
         congressional_discovered: list[str] = []
         try:
+            from datetime import timedelta
+
+            # Congressional gets its OWN lookback window, NOT the news-style
+            # hours-since-last-cycle `lookback_start` it used to share (the
+            # 2026-07-21 fix). PTRs are disclosed up to 30-45 days after the
+            # trade and only a handful are filed per day, so the shared
+            # hours-long window found ~zero filings on nearly every cycle --
+            # the signal scored 3 rows EVER (vs ~1,700 per other source) and
+            # the weekly scorecard showed "congressional: 0 scored, default
+            # 0.5 hit rate". A 30-day window is also what the signal's
+            # net-buying aggregate is meant to summarize. Affordable because
+            # per-filing parse results are cached on disk (cache_dir) -- each
+            # PDF is fetched/parsed once, not once per cycle.
+            congressional_since = today - timedelta(days=congressional.HOUSE_PTR_LOOKBACK_DAYS)
             house_transactions: list = []
             # fetch_recent_house_ptr_transactions only queries one calendar
             # year's disclosure index -- span the year boundary explicitly
             # if the lookback window crosses it (e.g. an early-January run
             # looking back into December).
-            for year in {lookback_start.date().year, today.year}:
+            for year in sorted({congressional_since.year, today.year}):
                 result = congressional.fetch_recent_house_ptr_transactions(
-                    year=year, user_agent=sec_user_agent, since=lookback_start.date(), until=today
+                    year=year,
+                    user_agent=sec_user_agent,
+                    since=congressional_since,
+                    until=today,
+                    cache_dir=congressional.DEFAULT_HOUSE_PTR_CACHE_DIR,
                 )
                 house_transactions.extend(result.transactions)
 
             congressional_transactions_by_ticker = congressional.aggregate_transactions_by_ticker(house_transactions)
+            # Smaller cap than news on purpose: a 30-day filing window
+            # surfaces far more tickers than an hours-long news window, and
+            # every universe symbol costs real per-symbol API/LLM calls.
+            # Top names by mention count over a rolling window are stable
+            # cycle-to-cycle, which is exactly what the weight tuner needs
+            # to accumulate scored congressional outcomes.
             congressional_discovered = rank_discovered_symbols(
-                [[txn.ticker] for txn in house_transactions], cap=discovery_cap, valid_universe=valid_universe_set
+                [[txn.ticker] for txn in house_transactions],
+                cap=congressional_discovery_cap,
+                valid_universe=valid_universe_set,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"congressional discovery pull failed, continuing without it: {exc}")
@@ -564,7 +597,8 @@ def run_cycle(
                 f"dynamic universe for this cycle: {len(held_symbols)} held position(s), "
                 f"{len(news_discovered)} news-discovered, {len(congressional_discovered)} "
                 f"congressional-discovered ({len(universe)} unique symbol(s) total), "
-                f"lookback since {lookback_start}"
+                f"news lookback since {lookback_start}, congressional lookback "
+                f"{congressional.HOUSE_PTR_LOOKBACK_DAYS} days"
             ),
             metadata={"universe": universe},
         )

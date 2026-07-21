@@ -5,11 +5,15 @@ import pytest
 from src.signals.congressional import (
     CongressionalSignalConfig,
     CongressionalTransaction,
+    FlaggedLine,
+    ParseResult,
     aggregate_transactions_by_ticker,
     compute_congressional_signal,
     filter_filings_by_date,
     parse_house_ptr_text,
     parse_ptr_text,
+    parse_result_from_cache_dict,
+    parse_result_to_cache_dict,
     parse_senate_ptr_text,
 )
 
@@ -760,3 +764,115 @@ class TestComputeCongressionalSignal:
         assert result.net_dollar_value_midpoint == pytest.approx(0.0)
         assert result.num_buy_transactions == 1
         assert result.num_sell_transactions == 1
+
+
+class TestParseResultCacheSerialization:
+    """The per-docId parse cache (added 2026-07-21 alongside the 30-day
+    congressional lookback window) round-trips ParseResult through a
+    JSON-safe dict. A stale/corrupt/old-format payload must deserialize to
+    None (meaning "refetch"), never crash or produce a wrong ParseResult."""
+
+    def _result(self) -> ParseResult:
+        return ParseResult(
+            transactions=[
+                CongressionalTransaction(
+                    chamber="house",
+                    source_doc_id="20033725",
+                    filer_name="PELOSI NANCY",
+                    owner="SPOUSE",
+                    ticker="AAPL",
+                    asset_name="Apple Inc.",
+                    transaction_type="purchase",
+                    transaction_date="2026-06-15",
+                    amount_low=1001.0,
+                    amount_high=15000.0,
+                    raw_line="raw text",
+                ),
+                CongressionalTransaction(
+                    chamber="house",
+                    source_doc_id="20033725",
+                    filer_name="PELOSI NANCY",
+                    owner="SELF",
+                    ticker="NVDA",
+                    asset_name="NVIDIA Corp",
+                    transaction_type="sale_partial",
+                    transaction_date="2026-06-20",
+                    amount_low=50000.0,
+                    amount_high=None,  # open-ended bracket survives round-trip
+                    raw_line="raw text 2",
+                ),
+            ],
+            flagged=[
+                FlaggedLine(
+                    chamber="house",
+                    source_doc_id="20033725",
+                    raw_line="mangled row",
+                    reason="page-break split",
+                )
+            ],
+        )
+
+    def test_round_trip_preserves_everything(self):
+        original = self._result()
+        restored = parse_result_from_cache_dict(parse_result_to_cache_dict(original))
+        assert restored == original
+
+    def test_dict_is_json_safe(self):
+        import json
+
+        payload = parse_result_to_cache_dict(self._result())
+        restored = parse_result_from_cache_dict(json.loads(json.dumps(payload)))
+        assert restored == self._result()
+
+    def test_empty_result_round_trips(self):
+        restored = parse_result_from_cache_dict(parse_result_to_cache_dict(ParseResult()))
+        assert restored == ParseResult()
+
+    def test_wrong_version_returns_none(self):
+        payload = parse_result_to_cache_dict(self._result())
+        payload["version"] = 999
+        assert parse_result_from_cache_dict(payload) is None
+
+    def test_non_dict_payload_returns_none(self):
+        assert parse_result_from_cache_dict(None) is None
+        assert parse_result_from_cache_dict([1, 2]) is None
+        assert parse_result_from_cache_dict("junk") is None
+
+    def test_malformed_fields_return_none(self):
+        payload = parse_result_to_cache_dict(self._result())
+        payload["transactions"][0].pop("ticker")
+        assert parse_result_from_cache_dict(payload) is None
+
+    def test_unexpected_field_returns_none(self):
+        payload = parse_result_to_cache_dict(self._result())
+        payload["flagged"][0]["surprise"] = True
+        assert parse_result_from_cache_dict(payload) is None
+
+    def test_disk_store_and_load_round_trip(self, tmp_path):
+        from src.signals.congressional import _load_cached_parse_result, _store_cached_parse_result
+
+        original = self._result()
+        _store_cached_parse_result(tmp_path, "20033725", original)
+        assert _load_cached_parse_result(tmp_path, "20033725") == original
+
+    def test_disk_load_missing_or_corrupt_returns_none(self, tmp_path):
+        from src.signals.congressional import _load_cached_parse_result
+
+        assert _load_cached_parse_result(tmp_path, "nope") is None
+        (tmp_path / "bad.json").write_text("{not json")
+        assert _load_cached_parse_result(tmp_path, "bad") is None
+
+    def test_disk_helpers_refuse_unsafe_doc_ids(self, tmp_path):
+        # A docId is used as a filename -- anything that could escape the
+        # cache dir (path separators, "..") must be refused outright.
+        from src.signals.congressional import _load_cached_parse_result, _store_cached_parse_result
+
+        _store_cached_parse_result(tmp_path, "../escape", self._result())
+        assert not (tmp_path.parent / "escape.json").exists()
+        assert _load_cached_parse_result(tmp_path, "../escape") is None
+
+    def test_no_cache_dir_is_a_noop(self):
+        from src.signals.congressional import _load_cached_parse_result, _store_cached_parse_result
+
+        _store_cached_parse_result(None, "20033725", self._result())
+        assert _load_cached_parse_result(None, "20033725") is None

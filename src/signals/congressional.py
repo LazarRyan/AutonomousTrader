@@ -70,6 +70,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date
+from pathlib import Path
 
 
 class UnparseableFilingError(Exception):
@@ -599,6 +600,86 @@ def aggregate_transactions_by_ticker(
     return buckets
 
 
+# How far back each cycle's congressional pull looks, in days. This is
+# deliberately NOT the news-style "since the last scheduled cycle" window
+# (a few hours): members have up to 30-45 days after a trade to file a PTR
+# and only a handful of PTRs are filed per day, so an hours-long window
+# catches ~zero filings per cycle (found live 2026-07-21: 19 of the prior
+# 20 cycles discovered 0 congressional tickers, and the signals table held
+# 3 congressional rows total vs ~1,700 per other source -- the scorecard's
+# "congressional: 0 scored" row). A multi-week window is also what
+# compute_congressional_signal()'s net-buying aggregate is semantically
+# meant to summarize.
+HOUSE_PTR_LOOKBACK_DAYS = 30
+
+# Where fetch_recent_house_ptr_transactions caches per-filing parse
+# results (one small JSON per docId) so a multi-week lookback window
+# doesn't re-download and re-parse the same few hundred PDFs on every one
+# of the 3x/day cycles. repo/data/cache/house_ptr/.
+DEFAULT_HOUSE_PTR_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "cache" / "house_ptr"
+
+_CACHE_FORMAT_VERSION = 1
+
+_SAFE_DOC_ID_RE = re.compile(r"^[\w.-]+$")
+
+
+def parse_result_to_cache_dict(result: ParseResult) -> dict:
+    """Pure ParseResult -> JSON-safe dict, for the per-docId parse cache.
+    Round-trips with parse_result_from_cache_dict (unit-tested)."""
+    import dataclasses
+
+    return {
+        "version": _CACHE_FORMAT_VERSION,
+        "transactions": [dataclasses.asdict(t) for t in result.transactions],
+        "flagged": [dataclasses.asdict(f) for f in result.flagged],
+    }
+
+
+def parse_result_from_cache_dict(payload: object) -> ParseResult | None:
+    """Pure inverse of parse_result_to_cache_dict. Returns None (never
+    raises) for anything that isn't a current-version, well-formed cache
+    payload -- a stale/corrupt/old-format cache entry must mean "refetch",
+    never a crash or a silently wrong ParseResult."""
+    if not isinstance(payload, dict) or payload.get("version") != _CACHE_FORMAT_VERSION:
+        return None
+    try:
+        return ParseResult(
+            transactions=[CongressionalTransaction(**t) for t in payload["transactions"]],
+            flagged=[FlaggedLine(**f) for f in payload["flagged"]],
+        )
+    except (KeyError, TypeError):
+        return None
+
+
+def _load_cached_parse_result(cache_dir: Path | None, doc_id: str) -> ParseResult | None:
+    import json
+
+    if cache_dir is None or not _SAFE_DOC_ID_RE.match(doc_id):
+        return None
+    path = Path(cache_dir) / f"{doc_id}.json"
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return parse_result_from_cache_dict(payload)
+
+
+def _store_cached_parse_result(cache_dir: Path | None, doc_id: str, result: ParseResult) -> None:
+    """Best-effort: a cache write failure (disk full, permissions) must
+    never take out the cycle's discovery -- worst case is a re-download
+    next cycle."""
+    import json
+
+    if cache_dir is None or not _SAFE_DOC_ID_RE.match(doc_id):
+        return
+    try:
+        cache_path = Path(cache_dir)
+        cache_path.mkdir(parents=True, exist_ok=True)
+        (cache_path / f"{doc_id}.json").write_text(json.dumps(parse_result_to_cache_dict(result)))
+    except OSError:
+        pass
+
+
 # ============================================================
 # Network / binary wrappers -- not unit-tested here (require live network,
 # and for the Senate, a multi-step session flow). See module docstring's
@@ -679,7 +760,7 @@ def fetch_house_ptr_pdf(doc_id: str, year: int, user_agent: str) -> bytes:
 
 
 def fetch_recent_house_ptr_transactions(
-    year: int, user_agent: str, since: date, until: date | None = None
+    year: int, user_agent: str, since: date, until: date | None = None, cache_dir: Path | None = None
 ) -> ParseResult:
     """Orchestrates House PTR discovery for one cycle: fetch the full
     year's disclosure index, narrow it to `since`/`until` via
@@ -693,6 +774,16 @@ def fetch_recent_house_ptr_transactions(
     scanned/image-only PDF) is skipped with a flagged entry rather than
     aborting the whole cycle's discovery -- consistent with this module's
     "one bad row/filing never discards everything else" discipline.
+
+    cache_dir, if given (run_cycle passes DEFAULT_HOUSE_PTR_CACHE_DIR),
+    caches each filing's parse result as {docId}.json so the same PDF is
+    fetched and parsed at most once across cycles -- required to make the
+    multi-week HOUSE_PTR_LOOKBACK_DAYS window affordable at 3 cycles/day.
+    A filing whose PDF fetched fine but had no extractable text (scanned/
+    image-only) is cached as a flagged-only result: retrying it every
+    cycle for 30 days can't ever succeed. A filing whose PDF couldn't be
+    FETCHED (network error) is flagged but deliberately NOT cached, so a
+    transient failure is retried next cycle.
 
     Callers spanning a year boundary (a lookback window starting in
     December and running into January) need to call this once per
@@ -710,21 +801,55 @@ def fetch_recent_house_ptr_transactions(
         filer_name = f"{filing.get('first', '')} {filing.get('last', '')}".strip()
         if not doc_id:
             continue
+
+        cached = _load_cached_parse_result(cache_dir, doc_id)
+        if cached is not None:
+            all_transactions.extend(cached.transactions)
+            all_flagged.extend(cached.flagged)
+            continue
+
         try:
             pdf_bytes = fetch_house_ptr_pdf(doc_id, year, user_agent)
-            text = extract_text_from_pdf(pdf_bytes)
         except Exception as exc:  # noqa: BLE001 -- one bad filing must not abort discovery
             all_flagged.append(
                 FlaggedLine(
                     chamber="house",
                     source_doc_id=doc_id,
                     raw_line="",
-                    reason=f"could not fetch/extract filing PDF, skipping: {exc}",
+                    reason=f"could not fetch filing PDF, skipping (will retry next cycle): {exc}",
                 )
             )
             continue
 
-        result = parse_house_ptr_text(text, source_doc_id=doc_id, filer_name=filer_name)
+        try:
+            text = extract_text_from_pdf(pdf_bytes)
+        except UnparseableFilingError as exc:
+            # Deterministic content problem (no text layer) -- cacheable,
+            # retrying can't help.
+            result = ParseResult(
+                flagged=[
+                    FlaggedLine(
+                        chamber="house",
+                        source_doc_id=doc_id,
+                        raw_line="",
+                        reason=f"could not extract text from filing PDF, skipping: {exc}",
+                    )
+                ]
+            )
+        except Exception as exc:  # noqa: BLE001 -- e.g. a truncated download; possibly transient, don't cache
+            all_flagged.append(
+                FlaggedLine(
+                    chamber="house",
+                    source_doc_id=doc_id,
+                    raw_line="",
+                    reason=f"could not extract filing PDF, skipping (will retry next cycle): {exc}",
+                )
+            )
+            continue
+        else:
+            result = parse_house_ptr_text(text, source_doc_id=doc_id, filer_name=filer_name)
+
+        _store_cached_parse_result(cache_dir, doc_id, result)
         all_transactions.extend(result.transactions)
         all_flagged.extend(result.flagged)
 

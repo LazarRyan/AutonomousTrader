@@ -1,5 +1,6 @@
 .env
 __pycache__/
+data/cache/
 *.pyc
 .pytest_cache/
 .coverage
